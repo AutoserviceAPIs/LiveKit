@@ -1,38 +1,45 @@
-# Use Python 3.10 slim image
-FROM python:3.10-slim
+# syntax=docker/dockerfile:1
 
-# Set working directory
-WORKDIR /app
+ARG PYTHON_VERSION=3.11
+# Fast Python builds using uv on Debian bookworm-slim
+FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim AS base
 
-# Install system dependencies
+ARG UID=10001
+
+# Ensures that logs are captured in realtime
+ENV PYTHONUNBUFFERED=1
+
+# Create unprivileged user
+RUN adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "/app" \
+    --shell "/sbin/nologin" \
+    --uid "${UID}" \
+    appuser
+
+# System build deps for common Python wheels
 RUN apt-get update && apt-get install -y \
     curl \
     ffmpeg \
     gcc \
     python3-dev \
-    && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
-# Install uv and upgrade pip/setuptools
-RUN pip install --upgrade pip setuptools wheel && pip install uv
+WORKDIR /app
 
-# Copy pyproject.toml and uv.lock
+# Dependency install first for better caching
 COPY pyproject.toml uv.lock ./
+RUN mkdir -p src
+RUN uv sync --locked
 
-# Create src directory and install dependencies using uv
-RUN mkdir -p src && uv sync --frozen --no-dev
-
-# Copy source code
-COPY src/ ./src/
+# Copy application code
+COPY . .
+RUN chown -R appuser:appuser /app
+USER appuser
 
 # Pre-download models/assets at build time
-RUN uv run python src/agent.py download-files
+RUN uv run src/agent.py download-files
 
-# Set environment variables
-ENV PYTHONPATH=/app/src
-ENV PYTHONUNBUFFERED=1
-
-# Expose port for health checks (optional)
-EXPOSE 8081
-
-# Run the agent
-CMD ["uv", "run", "python", "src/agent.py"]
+# Start the agent
+CMD ["uv", "run", "agent.py", "start"]

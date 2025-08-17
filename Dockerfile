@@ -32,6 +32,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN mkdir -p src
 RUN uv sync --locked
+RUN pip install -r requirements.txt
 
 # Copy application code
 COPY . .

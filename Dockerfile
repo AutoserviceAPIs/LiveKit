@@ -12,20 +12,20 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-RUN pip install uv
+# Install uv and upgrade pip/setuptools
+RUN pip install --upgrade pip setuptools wheel && pip install uv
 
 # Copy pyproject.toml and uv.lock
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies using uv
-RUN uv sync --frozen --no-dev
+# Create src directory and install dependencies using uv
+RUN mkdir -p src && uv sync --frozen --no-dev
 
 # Copy source code
 COPY src/ ./src/
 
 # Pre-download models/assets at build time
-RUN python src/agent.py download-files
+RUN uv run python src/agent.py download-files
 
 # Set environment variables
 ENV PYTHONPATH=/app/src

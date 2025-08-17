@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Dependency install first for better caching
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock requirements.txt ./
 RUN mkdir -p src
 RUN uv sync --locked
 RUN pip install -r requirements.txt

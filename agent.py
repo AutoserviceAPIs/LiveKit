@@ -1,3 +1,9 @@
+import logging
+import aiohttp
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+import json
+
 from dotenv import load_dotenv
 from livekit.agents import (
     NOT_GIVEN,
@@ -13,23 +19,17 @@ from livekit.agents import (
     cli,
     metrics,
 )
-from livekit import agents
-from livekit.agents import AgentSession, Agent, RoomInputOptions
-from livekit.plugins import (
-    openai,
-    noise_cancellation,
-    elevenlabs,
-    deepgram,
-    silero
-)
-
-load_dotenv()
+from livekit.agents.llm import function_tool
+from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
+from livekit.plugins.elevenlabs import VoiceSettings
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+logger = logging.getLogger("agent")
+
+load_dotenv(".env")
 import asyncio
 import subprocess
 from livekit import rtc
-
 
 async def publish_background(room: rtc.Room, file_path: str):
     # ffmpeg decode mp3 -> PCM 16-bit, 48kHz, mono
@@ -71,16 +71,451 @@ async def publish_background(room: rtc.Room, file_path: str):
 
     asyncio.create_task(read_audio())
 
-class Assistant(Agent):
+class AutomotiveBookingAssistant(Agent):
     def __init__(self) -> None:
-        super().__init__(instructions="You are a helpful voice AI assistant. Help customer book service appointment at Autoservice AI. Response english only")
+        super().__init__(
+           instructions="""You are a professional automotive assistant for Woodbine Toyota. Help customer booking an appointment. Must follow the rules and conversation flow below.
+
+## CUSTOMER LOOKUP:
+- At the beginning of the conversation, call lookup_customer function first.
+- lookup_customer will return customer information which may include name, car details, or both.
+- Use the returned information to confirm with customer before proceeding.
+
+## RULES:
+- After collecting car year make and model at step 2, must be trigger save_customer_information tool.
+- After collecting services and transportation at step 4, must be trigger save_services_detail tool.
+- Always trigger tools in step if available.
+- Call create_appointment tool after booking confirmed at step 9
+
+- Do not say things like "Let me save your information" or "Please wait." Just proceed silently to the next step.
+- If user asks for recall service, reschedule appointment or cancel appointment, trigger transfer_call tool
+- If user asks to speak with someone, customer service, or user is frustrated: trigger transfer_call tool
+
+- If user asks address: "80 Queens Plate Dr, Etobicoke"
+- If user asks price: "oil change starts at $130 plus tax"
+- If user asks Wait time: "45 minutes to 1 hour"
+
+## Follow this conversation flow:
+
+Step 1. Must gather customer name
+- Always start with greeting: "Hi there, you reached Woodbine Toyota Service. I'll be glad to help with your appointment."
+- If customer name is found from lookup_customer: Ask "Am I speaking with {first_name}?"
+  - If YES: Proceed to Step 2
+  - If NO or user corrects: Ask "What's your first name?" then "What's your last name?"
+- If no customer name found: Ask "Can I get your first name and spelling?"
+- After collecting first name, Ask for last name: "Can I get your last name and spelling?"
+- If user says "no" or not correct:
+    - ask first name: "What's your first name again?"
+    - After collecting first name, Ask for last name again: "What is your last name?"
+- Do not use "Mr." or "Mrs."
+
+Step 2. Must gather customer car before going to Step 3
+- If car details are found from lookup_customer: Ask "Would you like to book an appointment for your {year} {model}?"
+  - If YES: Proceed to Step 3
+  - If NO or user corrects: Ask for car details as below
+- If no car details found: Ask for car year, make, and model: "Can you please provide your car's year, make, and model, for example, 2018 Toyota Camry?"
+    - If car year missing: "What year is your car?"
+    - If car make missing: "is that a {make}"
+    - If car model missing: "And the model?"
+- After collecting first_name, last_name, car_year, car_make, and car_model, must call save_customer_information tool with these parameters. Do not narrate the action.
+
+Step 3. Must gather services before going to Step 4
+- After trigger save_customer_information tool, ask for service: "What services does your car need?"
+- Valid services can be maintenance services such as oil change, flat, tire balance, tire rotation, alignment, filters, wipers, or repair services such as diagnostics, battery, AC, brakes, key, electrical, inspection, glass, software
+- Do not call save_services_detail yet.
+- If you cannot match the user's answer to any valid service code above, say: "I didn't catch that. What services does your car need? For example, oil change, brakes, or battery?"
+- Do not proceed to Step 4 until at least one valid service is captured.
+
+Step 4. Must gather user transportation before going to Step 5
+- After capturing a valid service, ask about transportation.
+- If services include a repair-related items: Ask: "Will you drop off your car?"
+    Set transportation = DROP_OFF.
+- Else: Ask: "Will you drop off your car or wait while we do the work?"
+    Set transportation to DROP_OFF or WAITER accordingly.
+- This is required before step 5.
+- If services includes maintenance, first service or general service: Set is_maintenance to 1, Else: Set is_maintenance to 0.
+- After collecting services and transportation, must call save_services_detail tool with these parameters and get available timeslots for step 5. 
+- Do not narrate or mention that you are saving data.
+
+Step 5. Must gather mileage before going to Step 6
+- After calling the save_services_detail function, ask for mileage: "Do you happen to know your car's current mileage?"
+
+Step 6. Must offer first availability before going to step 7.
+- Start by offering the first availability: "My first availability is {DATE} at {TIME}. Would you like to book that, or tell me your preferred date and time"
+
+Step 7. Assist user to find availability before going to step 8.
+- If availability not selected, offer 3 options based on date time customer requested. 
+- Today's date is: {current_date}
+- Tomorrow's date is {tomorrow_date}
+- Check if availability has been selected by the customer.
+- Based on the customer's request and the current date and time, only offer maximum 3 available time slots.
+    *   If the customer requested "today," offer time slots that are from the current date.
+    *   If the customer requested "tomorrow," offer time slots that are available on tomorrow's date.
+    *   If the customer requested a specific date, offer time slots that are available on that date.
+- Ensure that no availability is offered if it is not available from calendar
+
+Step 8. If date and time is selected, Must confirm appointment before going to step 9.
+- Say: "Just to be sure, {NAME}, I have you scheduled for {SERVICE} on {DATE} at {TIME}. Do you confirm this appointment?"
+- If declined: return to Step 7
+- If user says no, or says another name: 
+    ask first name: "What's your first name?"
+    ask last name: "What's your last name?".
+
+Step 9. If booking confirmed, Book appointment.
+- Say: "Great! Thank you. You are booked and will receive a confirmation message. Have a great day, and we will see you soon"
+- Trigger tool name create_appointment.
+
+Keep responses natural and conversational, avoiding complex formatting or symbols.""",
+        )
+        
+        # In-memory storage for customer data and appointments
+        self.customer_data = {
+            "first_name": "",
+            "last_name": "",
+            "car_make": "",
+            "car_model": "",
+            "car_year": "",
+            "phone": "",
+            "services": [],
+            "transportation": None,
+            "mileage": None,
+            "selected_date": None,
+            "selected_time": None,
+            "services_transcript": "",
+            "is_maintenance": 0
+        }
+        
+        # Service mapping
+        self.service_mapping = {
+            "oil change": "2OILCHANGE",
+            "maintenance": "1MAINTENANCE",
+            "tires": "3TIRES",
+            "flat": "4FLAT",
+            "balance": "5BALANCE",
+            "rotation": "6ROTATION",
+            "alignment": "7ALIGNMENT",
+            "diagnostics": "8DIAG",
+            "battery": "9BATTERY",
+            "ac": "10AC",
+            "repair": "11REPAIR",
+            "brakes": "12BRAKES",
+            "key": "13KEY",
+            "electrical": "14ELECTRICAL",
+            "inspection": "15INSPECTION",
+            "air filter": "16AIRFILTER",
+            "glass": "17GLASS",
+            "accessory": "18ACCESSORY",
+            "software": "19SOFTWARE",
+            "body shop": "20BODYSHOP",
+            "car wash": "21CARWASH",
+            "wipers": "22WIPERS",
+            "differential": "23DIFFERENTIAL",
+            "toyota care": "24TOYOTACARE",
+            "recall": "RECALL"
+        }
+        
+        # Transportation mapping
+        self.transportation_mapping = {
+            "DROP_OFF": "00000000-0000-0000-0000-000000000000",
+            "WAITER": "11111111-1111-1111-1111-111111111111"
+        }
+        
+        # Generate available time slots for next 2 weeks
+        self.available_slots = self._generate_available_slots()
+        
+        # API URLs
+        self.CHECK_URL = "https://api.example.com/check"  # Replace with your actual API URL
+        self.CARS_URL = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/get"    # Replace with your actual API URL
+
+    def _generate_available_slots(self) -> Dict[str, List[str]]:
+        """Generate available time slots for the next 2 weeks"""
+        slots = {}
+        start_date = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)
+        
+        for i in range(14):  # Next 2 weeks
+            current_date = start_date + timedelta(days=i)
+            date_str = current_date.strftime("%Y-%m-%d")
+            day_name = current_date.strftime("%A")
+            
+            # Skip Sundays
+            if day_name == "Sunday":
+                continue
+                
+            # Saturday: 9 AM - 2 PM
+            if day_name == "Saturday":
+                slots[date_str] = [
+                    "09:00", "10:00", "11:00", "12:00", "13:00"
+                ]
+            else:
+                # Weekdays: 9 AM - 6 PM
+                slots[date_str] = [
+                    "09:00", "10:00", "11:00", "12:00", "13:00", 
+                    "14:00", "15:00", "16:00", "17:00"
+                ]
+        
+        return slots
+
+    @function_tool
+    async def save_customer_information(self, context: RunContext, first_name: str, last_name: str, 
+                                      car_make: str, car_model: str, car_year: str) -> str:
+        """Save customer and car information.
+        
+        Args:
+            first_name: Customer's first name
+            last_name: Customer's last name
+            car_make: Car make (e.g., Toyota)
+            car_model: Car model (e.g., Camry)
+            car_year: Car year (e.g., 2020)
+        """
+        logger.info(f"Saving customer information: {first_name} {last_name}, {car_year} {car_make} {car_model}")
+        
+        self.customer_data["first_name"] = first_name
+        self.customer_data["last_name"] = last_name
+        self.customer_data["car_make"] = car_make
+        self.customer_data["car_model"] = car_model
+        self.customer_data["car_year"] = car_year
+        
+        return "Customer information saved successfully."
+
+    @function_tool
+    async def save_services_detail(self, context: RunContext, services: List[str], 
+                                 transportation: str, mileage: Optional[str] = None) -> str:
+        """Save service details and preferences and get available timeslots.
+        
+        Args:
+            services: List of services requested
+            transportation: Drop off or wait (DROP_OFF or WAITER)
+            mileage: Car mileage (optional)
+        """
+        logger.info(f"Saving services: {services}, transportation: {transportation}")
+        
+        self.customer_data["services"] = services
+        self.customer_data["transportation"] = transportation
+        self.customer_data["mileage"] = mileage or "0"
+        
+        # Determine if maintenance service
+        maintenance_services = ["oil change", "maintenance", "tires", "flat", "balance", 
+                              "rotation", "alignment", "air filter", "wipers", "differential", 
+                              "toyota care"]
+        
+        is_maintenance = any(service.lower() in maintenance_services for service in services)
+        self.customer_data["is_maintenance"] = 1 if is_maintenance else 0
+        
+        # Get available slots for the next few days
+        available_slots = {}
+        today = datetime.now().date()
+        
+        for i in range(7):  # Next 7 days
+            check_date = today + timedelta(days=i)
+            date_str = check_date.strftime("%Y-%m-%d")
+            
+            if date_str in self.available_slots:
+                available_slots[date_str] = self.available_slots[date_str]
+        
+        return f"Service details saved. Available slots for next 7 days: {json.dumps(available_slots)}"
+
+    @function_tool
+    async def check_available_slots(self, context: RunContext, preferred_date: Optional[str] = None) -> str:
+        """Check available time slots for a specific date.
+        
+        Args:
+            preferred_date: Preferred date in YYYY-MM-DD format (optional)
+        """
+        logger.info(f"Checking available slots for date: {preferred_date}")
+        
+        if preferred_date:
+            if preferred_date in self.available_slots:
+                slots = self.available_slots[preferred_date]
+                return f"Available slots on {preferred_date}: {', '.join(slots)}"
+            else:
+                return f"No available slots on {preferred_date}"
+        else:
+            # Return next 3 available dates
+            available_dates = list(self.available_slots.keys())[:3]
+            result = {}
+            for date in available_dates:
+                result[date] = self.available_slots[date]
+            return f"Next available dates: {json.dumps(result)}"
+
+    @function_tool
+    async def create_appointment(self, context: RunContext, first_name: str, last_name: str,
+                               car_make: str, car_model: str, car_year: str, services: List[str],
+                               transportation: str, services_transcript: str, is_maintenance: int,
+                               selected_date: str, selected_time: str) -> str:
+        """Create and finalize the booking appointment.
+        
+        Args:
+            first_name: Customer's first name
+            last_name: Customer's last name
+            car_make: Car make
+            car_model: Car model
+            car_year: Car year
+            services: List of services requested
+            transportation: Drop off or wait
+            services_transcript: Transcript of the request for services
+            is_maintenance: Whether this is a maintenance service (0 or 1)
+            selected_date: Selected appointment date in YYYY-MM-DD format
+            selected_time: Selected appointment time in HH:mm:ss format
+        """
+        logger.info(f"Creating appointment for {first_name} {last_name} on {selected_date} at {selected_time}")
+        
+
+        # Create appointment ID
+        appointment_id = f"APT_{selected_date}_{selected_time}_{first_name}_{last_name}"
+        
+        # Remove the slot from available slots
+        # self.available_slots[selected_date].remove(selected_time)
+        
+        # Store appointment details
+        appointment_data = {
+            "appointment_id": appointment_id,
+            "customer_name": f"{first_name} {last_name}",
+            "car_info": f"{car_year} {car_make} {car_model}",
+            "services": services,
+            "services_transcript": services_transcript,
+            "transportation": transportation,
+            "is_maintenance": is_maintenance,
+            "date": selected_date,
+            "time": selected_time,
+            "status": "confirmed",
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # In a real implementation, you would save this to a database
+        logger.info(f"Appointment created: {json.dumps(appointment_data)}")
+        
+        return f"Appointment confirmed! Your appointment ID is {appointment_id}. You have service scheduled for {selected_date} at {selected_time}. We'll send a confirmation message shortly."
+
+    @function_tool
+    async def transfer_call(self, context: RunContext) -> str:
+        """Transfer call to human agent when user requested.
+        
+        This function is called when the user wants to speak with a human agent.
+        """
+        logger.info("Transferring call to human agent")
+        
+        # In a real implementation, this would initiate a call transfer
+        # For now, we'll just return a message
+        return "I'm transferring you to a human agent. Please hold on."
+
+    @function_tool
+    async def lookup_customer(self, context: RunContext, phone: str) -> str:
+        """Look up customer information by phone number.
+        
+        Args:
+            phone: Customer's phone number
+        """
+        logger.info(f"Looking up customer with phone: {phone}")
+        
+        # Check if customer data is already populated
+        if (self.customer_data["first_name"] and 
+            self.customer_data["last_name"] and 
+            self.customer_data["car_make"] and 
+            self.customer_data["car_model"] and 
+            self.customer_data["car_year"]):
+            
+            # Customer found, create response from existing customer_data
+            result = {
+                "success": True,
+                "firstName": self.customer_data["first_name"],
+                "lastName": self.customer_data["last_name"],
+                "make": self.customer_data["car_make"],
+                "model": self.customer_data["car_model"],
+                "year": self.customer_data["car_year"],
+                "message": f"Found customer record with name: {self.customer_data['first_name']} {self.customer_data['last_name']} with car {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}"
+            }
+            # Store the lookup result for later use
+            return json.dumps(result)
+        else:
+            result = {
+                "success": False,
+                "message": "Customer not found in our system. Please ask customer information."
+            }
+            return json.dumps(result)  
+
+    async def findCustomer(self, phone: str) -> bool:
+        """Find customer by phone number and populate customer_data.
+        
+        This function works like the lookupCustomer in BOOKING_ASSISTANT.md
+        - Calls API to find customer by phone number
+        - Populates customer_data if found
+        - Returns True if found, False otherwise
+        
+        Args:
+            phone: Customer's phone number
+        """
+        try:
+            # Get last 10 digits of phone number
+            clean_phone = ''.join(filter(str.isdigit, phone))
+            if len(clean_phone) >= 10:
+                phone_10_digits = clean_phone[-10:]
+            else:
+                logger.error(f"Invalid phone number: {phone}")
+                return False
+            
+            # Call API to find customer
+            url = self.CARS_URL
+            params = {"phone": phone_10_digits}
+            logger.info(f"Calling API: {url} with params: {params}")
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        # Get response text first
+                        response_text = await response.text()
+                        logger.info(f"API Response: {response_text}")
+                        
+                        try:
+                            # Try to parse as JSON
+                            result = json.loads(response_text)
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse JSON response: {response_text}")
+                            return False
+                        
+                        # Check if customer found
+                        if (result and not result.get("error") and 
+                            result.get("Found") and 
+                            result.get("Cars") and 
+                            len(result["Cars"]) > 0):
+                            
+                            # Get first car data
+                            car_data = result["Cars"][0]
+                            
+                            # Populate customer_data
+                            self.customer_data["first_name"] = car_data.get("fname", "")
+                            self.customer_data["last_name"] = car_data.get("lname", "")
+                            self.customer_data["car_model"] = car_data.get("model", "")
+                            self.customer_data["car_make"] = car_data.get("make", "")
+                            self.customer_data["car_year"] = car_data.get("year", "")
+                            self.customer_data["phone"] = phone_10_digits
+                            logger.info(f"Customer found: {self.customer_data['first_name']} {self.customer_data['last_name']} with {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}")
+                            return True
+                        else:
+                            logger.info(f"Customer not found for phone: {phone_10_digits}")
+                            return False
+                    else:
+                        logger.error(f"API call failed with status {response.status}")
+                        return False
+                        
+        except Exception as error:
+            logger.error(f"Customer lookup error: {error}")
+            return False
 
 
-async def entrypoint(ctx: agents.JobContext):
+def prewarm(proc: JobProcess):
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+async def entrypoint(ctx: JobContext):
+    # Logging setup
+    ctx.log_context_fields = {
+        "room": ctx.room.name,
+    }
+
+    # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
     session = AgentSession(
         # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all providers at https://docs.livekit.io/agents/integrations/llm/
-        llm=openai.LLM(model="gpt-4o-mini", api_key="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"),
+        llm=openai.LLM(model="gpt-4o-mini"),
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all providers at https://docs.livekit.io/agents/integrations/stt/
         stt=deepgram.STT(model="nova-3", language="en-US", api_key="98e42a6de0d4660afec26ebcbda8499f42bd4b5d"),
@@ -90,26 +525,61 @@ async def entrypoint(ctx: agents.JobContext):
             voice_id="xcK84VTjd6MHGJo2JVfS",
             model="eleven_flash_v2_5",
             api_key="59bb59df13287e23ba2da37ea6e48724",
-            # voice_settings= {
-            #     "similarity_boost": 0.4,
-            #     "speed": 1.1,
-            #     "stability": 0.3,
-            #     "style": 1,
-            #     "use_speaker_boost": True
-            # }
+            voice_settings= VoiceSettings(
+                similarity_boost=0.4,
+                speed=0.9,
+                stability=0.3,
+                style=1,
+                use_speaker_boost=True
+            )
         ),
         # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
 
+    # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
+    # when it's detected, you may resume the agent's speech
+    @session.on("agent_false_interruption")
+    def _on_agent_false_interruption(ev: AgentFalseInterruptionEvent):
+        logger.info("false positive interruption, resuming")
+        session.generate_reply(instructions=ev.extra_instructions or NOT_GIVEN)
+
+    # Metrics collection, to measure pipeline performance
+    usage_collector = metrics.UsageCollector()
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        metrics.log_metrics(ev.metrics)
+        usage_collector.collect(ev.metrics)
+
+    async def log_usage():
+        summary = usage_collector.get_summary()
+        logger.info(f"Usage: {summary}")
+
+    ctx.add_shutdown_callback(log_usage)
+
+    # Create agent instance
+    agent = AutomotiveBookingAssistant()
+    
+    # Try to find customer by phone number if available
+    # You can get phone number from room metadata or other sources
+    # phone_number = ctx.room.metadata.get("phone_number") if ctx.room.metadata else None
+    phone_number = "8055057710"
+    if phone_number:
+        logger.info(f"Attempting to find customer with phone: {phone_number}")
+        found = await agent.findCustomer(phone_number)
+        if found:
+            logger.info("Customer found and data populated")
+        else:
+            logger.info("Customer not found, will proceed with normal flow")
+    
+    # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
+        agent=agent,
         room=ctx.room,
-        agent=Assistant(),
         room_input_options=RoomInputOptions(
             # LiveKit Cloud enhanced noise cancellation
             # - If self-hosting, omit this parameter
@@ -119,17 +589,12 @@ async def entrypoint(ctx: agents.JobContext):
     )
     await publish_background(ctx.room, "office.mp3")
     await session.generate_reply(
-        instructions="Greet the user and Help customer book service appointment at Autoservice AI. English"
+        instructions="Greet user"
     )
 
-def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    # Join the room and connect to the user
+    await ctx.connect()
 
 
 if __name__ == "__main__":
-    agents.cli.run_app(agents.WorkerOptions(
-        entrypoint_fnc=entrypoint,
-        prewarm_fnc=prewarm,
-        # agent_name is required for explicit dispatch
-        agent_name="my-telephony-agent"
-    ))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))

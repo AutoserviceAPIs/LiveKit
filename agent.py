@@ -104,14 +104,12 @@ class AutomotiveBookingAssistant(Agent):
 ## CUSTOMER LOOKUP:
 - At the beginning of the conversation, call lookup_customer function first (We already have customer phone number).
 - lookup_customer returns customer name, car details, or booking details.
-- Use the returned information to confirm with customer before proceeding.
 
 ## RULES:
 - After collecting car year make and model: trigger save_customer_information tool
 - After collecting services and transportation: trigger save_services_detail tool
 - After booking: trigger create_appointment
 - Do not say things like "Let me save your information" or "Please wait." Just proceed silently to next step
-- Any time user say "Repeat please" then repeat previous question
 - For recall, reschedule appointment or cancel appointment: trigger transfer_call tool
 - For speak with someone, customer service, or user is frustrated: trigger transfer_call tool
 - For address: "80 Queens Plate Dr, Etobicoke"
@@ -121,12 +119,12 @@ class AutomotiveBookingAssistant(Agent):
 ## Follow this conversation flow:
 
 Step 1. Gather First and Last Name
-- If customer name and vehicle found from lookup_customer: Hello {first_name}, welcome back to Woodbine Toyota! What service would you like for your {year} {model}?. Proceed to Step 3
-- If only customer name found from lookup_customer: Hello {first_name}, welcome back to Woodbine Toyota! What is your car's year, make, and model?. Proceed to Step 2
-- If customer name not found: Hello! you reached Woodbine Toyota Service. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
-    If first name or last name not captured: What is the spelling of your first name / last name?
+- If customer name and car details found: Hello {first_name}! welcome back to Woodbine Toyota. I see you are calling to schedule an appointment. What service would you like for your {year} {model}?. Proceed to Step 3
+- If car details not found: Hello {first_name}! welcome back to Woodbine Toyota. I see you are calling to schedule an appointment. What is your car's year, make, and model?. Proceed to Step 2
+- If customer name not found: Hello! You reached Woodbine Toyota Service. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
 
 Step 2. Gather vehicle year make and model
+- If first name or last name not captured: What is the spelling of your first name / last name?
 - Once both first name and last name captured, Ask for the vehicle's year make and model? for example, 2025 Toyota Camry
 - call save_customer_information tool
 
@@ -142,11 +140,11 @@ Step 4. Gather transportation
 - Proceed to Step 5
 
 Step 5. Gather mileage
-- Once services captured, Ask what is the mileage
+- Once transportation captured, Ask what is the mileage
     - If do not know, proceed to Step 6
 
 Step 6. Offer first availability
-- offer the first availability and ask if that will work, or if the user has a specific time
+- After response, offer the first availability and ask if that will work, or if the user has a specific time
 
 Step 7. Find availability
 If first availability works for user, book it
@@ -549,7 +547,7 @@ async def entrypoint(ctx: JobContext):
     @session.on("user_state_changed")
     def _on_user_state_changed(ev: UserStateChangedEvent):
         logger.info(f"User state changed: {ev.new_state}")
-        if ev.new_state == "speaking":  
+        if ev.new_state == "speaking" || ev.new_state == "away":  
             cancel_timeout()
 
     # sometimes background noise could interrupt the agent session, these are considered false positive interruptions

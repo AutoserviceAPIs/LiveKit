@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from livekit.agents import (
     NOT_GIVEN,
     Agent,
+    UserStateChangedEvent,
     AgentFalseInterruptionEvent,
     AgentSession,
     JobContext,
@@ -18,18 +19,42 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     metrics,
+    get_job_context,
 )
+from livekit.agents.metrics import TTSMetrics
+from livekit import api
 from livekit.agents.llm import function_tool
 from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
 from livekit.plugins.elevenlabs import VoiceSettings
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
-
+from livekit import agents
 logger = logging.getLogger("agent")
 
 load_dotenv(".env")
 import asyncio
 import subprocess
 from livekit import rtc
+
+# Extract phone number from room name
+def extract_phone_from_room_name(room_name: str) -> str:
+    """Extract phone number from room name format: call-_8055057710_uHsvtynDWWJN"""
+    import re
+    pattern = r'call-_(\d+)_'
+    match = re.search(pattern, room_name)
+    return match.group(1) if match else ""
+
+# Add hangup_call function according to LiveKit documentation
+async def hangup_call():
+    ctx = get_job_context()
+    if ctx is None:
+        # Not running in a job context
+        return
+    
+    await ctx.api.room.delete_room(
+        api.DeleteRoomRequest(
+            room=ctx.room.name,
+        )
+    )
 
 async def publish_background(room: rtc.Room, file_path: str):
     # ffmpeg decode mp3 -> PCM 16-bit, 48kHz, mono
@@ -77,7 +102,7 @@ class AutomotiveBookingAssistant(Agent):
            instructions="""You are a receptionist for Woodbine Toyota. Help customers book appointments.
 
 ## CUSTOMER LOOKUP:
-- At the beginning of the conversation, call lookup_customer function first.
+- At the beginning of the conversation, call lookup_customer function first (We already have customer phone number).
 - lookup_customer returns customer name, car details, or booking details.
 - Use the returned information to confirm with customer before proceeding.
 
@@ -86,7 +111,7 @@ class AutomotiveBookingAssistant(Agent):
 - After collecting services and transportation: trigger save_services_detail tool
 - After booking: trigger create_appointment
 - Do not say things like "Let me save your information" or "Please wait." Just proceed silently to next step
-
+- Any time user say "Repeat please" then repeat previous question
 - For recall, reschedule appointment or cancel appointment: trigger transfer_call tool
 - For speak with someone, customer service, or user is frustrated: trigger transfer_call tool
 - For address: "80 Queens Plate Dr, Etobicoke"
@@ -131,7 +156,8 @@ Else:
             If availability is found, confirm with: Just to be sure, you would like to book ...
     On book:
         Inform the user they will receive an email or text confirmation shortly.
-        Trigger tool name create_appointment.""",
+        Trigger tool name create_appointment.
+        After triggering create_appointment, say goodbye and the call will automatically end.""",
     )
         
         # In-memory storage for customer data and appointments
@@ -192,6 +218,9 @@ Else:
         # API URLs
         self.CHECK_URL = "https://api.example.com/check"  # Replace with your actual API URL
         self.CARS_URL = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/get"    # Replace with your actual API URL
+        
+        # Flag to track if appointment was created
+        self.appointment_created = False
 
     def _generate_available_slots(self) -> Dict[str, List[str]]:
         """Generate available time slots for the next 2 weeks"""
@@ -350,7 +379,13 @@ Else:
         # In a real implementation, you would save this to a database
         logger.info(f"Appointment created: {json.dumps(appointment_data)}")
         
-        return f"Appointment confirmed! Your appointment ID is {appointment_id}. You have service scheduled for {selected_date} at {selected_time}. We'll send a confirmation message shortly."
+        # Set flag to indicate appointment was created - this will trigger hangup after goodbye
+        self.appointment_created = True
+        
+        # Set flag to indicate appointment was created - this will trigger hangup after goodbye
+        self.appointment_created = True
+        
+        return f"Appointment confirmed! Your appointment ID is {appointment_id}. You have service scheduled for {selected_date} at {selected_time}. We'll send a confirmation message shortly. Have a great day!"
 
     @function_tool
     async def transfer_call(self, context: RunContext) -> str:
@@ -468,6 +503,8 @@ Else:
             return False
 
 
+
+
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
@@ -506,8 +543,15 @@ async def entrypoint(ctx: JobContext):
         preemptive_generation=True,
     )
 
+    @session.on("user_state_changed")
+    def _on_user_state_changed(ev: UserStateChangedEvent):
+        logger.info(f"User state changed: {ev.new_state}")
+        if ev.new_state == "speaking":  
+            cancel_timeout()
+
     # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
     # when it's detected, you may resume the agent's speech
+
     @session.on("agent_false_interruption")
     def _on_agent_false_interruption(ev: AgentFalseInterruptionEvent):
         logger.info("false positive interruption, resuming")
@@ -520,6 +564,71 @@ async def entrypoint(ctx: JobContext):
     def _on_metrics_collected(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
+        
+        # Check if this is TTS metrics and appointment was created
+        if agent.appointment_created and isinstance(ev.metrics, TTSMetrics):
+            print("TTS metrics collected")
+            audio_duration = ev.metrics.audio_duration
+            if audio_duration > 0:
+                hangup_delay = audio_duration + 0.5  # Add 0.5s buffer
+                logger.info(f"TTS audio duration: {audio_duration}s, scheduling hangup in {hangup_delay}s")
+                asyncio.create_task(delayed_hangup(ctx, hangup_delay))
+        
+        # Restart timeout after each TTS response (agent finished speaking)
+        if isinstance(ev.metrics, TTSMetrics):
+            # Start timeout after audio duration finishes
+            audio_duration = ev.metrics.audio_duration
+            if audio_duration > 0:
+                asyncio.create_task(delayed_timeout_start(audio_duration))
+    
+    # Add timeout handler for user silence
+    TIMEOUT_SECONDS = 10  # Configurable timeout
+    timeout_task = None
+    
+    async def timeout_handler():
+        """Handle timeout when user doesn't respond"""
+        await asyncio.sleep(TIMEOUT_SECONDS)
+        logger.info(f"User timeout after {TIMEOUT_SECONDS}s, triggering follow-up")
+        await session.generate_reply(
+            instructions="Repeat please"
+        )
+    
+    def start_timeout():
+        """Start a new timeout task"""
+        nonlocal timeout_task
+        if timeout_task and not timeout_task.done():
+            timeout_task.cancel()
+        timeout_task = asyncio.create_task(timeout_handler())
+        logger.info(f"Timeout started for {TIMEOUT_SECONDS}s")
+    
+    def cancel_timeout():
+        """Cancel the current timeout task"""
+        nonlocal timeout_task
+        if timeout_task and not timeout_task.done():
+            timeout_task.cancel()
+            logger.info("Timeout cancelled")
+    
+    async def delayed_timeout_start(audio_duration):
+        """Start timeout after audio finishes playing"""
+        await asyncio.sleep(audio_duration + 0.5)  # Wait for audio to finish + buffer
+        start_timeout()
+        logger.info(f"Timeout started after {audio_duration}s audio finished")
+
+    async def delayed_hangup(ctx, delay):
+        """Hangup after calculated delay based on audio duration"""
+        await asyncio.sleep(delay)
+        logger.info("Hanging up call after appointment creation")
+        
+        # Use LiveKit's proper hangup method to end call for all participants
+        try:
+            await hangup_call()
+            logger.info("SIP call hung up successfully - all participants disconnected")
+        except Exception as e:
+            logger.error(f"Error hanging up SIP call: {e}")
+        
+        # Then shutdown the agent
+        logger.info("Appointment created successfully, shutting down agent")
+        ctx.shutdown(reason="Appointment created successfully")
 
     async def log_usage():
         summary = usage_collector.get_summary()
@@ -529,11 +638,11 @@ async def entrypoint(ctx: JobContext):
 
     # Create agent instance
     agent = AutomotiveBookingAssistant()
-    
+    # Store context reference for shutdown
+    agent._ctx = ctx
+
     # Try to find customer by phone number if available
-    # You can get phone number from room metadata or other sources
-    # phone_number = ctx.room.metadata.get("phone_number") if ctx.room.metadata else None
-    phone_number = "8055057710"
+    phone_number = extract_phone_from_room_name(ctx.room.name)
     if phone_number:
         logger.info(f"Attempting to find customer with phone: {phone_number}")
         found = await agent.findCustomer(phone_number)
@@ -564,3 +673,4 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+        # agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="my-telephony-agent"))

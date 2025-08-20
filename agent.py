@@ -547,7 +547,7 @@ async def entrypoint(ctx: JobContext):
     @session.on("user_state_changed")
     def _on_user_state_changed(ev: UserStateChangedEvent):
         logger.info(f"User state changed: {ev.new_state}")
-        if ev.new_state == "speaking" || ev.new_state == "away":  
+        if ev.new_state == "speaking" or ev.new_state == "away":  
             cancel_timeout()
 
     # sometimes background noise could interrupt the agent session, these are considered false positive interruptions

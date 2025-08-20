@@ -96,47 +96,43 @@ class AutomotiveBookingAssistant(Agent):
 ## Follow this conversation flow:
 
 Step 1. Gather First and Last Name
-- Always start with greeting: "Hi there, you reached Woodbine Toyota Service. I'll be glad to help with your appointment."
-- If customer name and vehicle found from lookup_customer: Welcome back {first_name}. What service would you like for your {year} {model}? and Proceed to Step 3
-- If only customer name found from lookup_customer: Welcome back {first_name}. What is your car's year, make, and model? and Proceed to Step 2
-- If customer name not found: Who do I have the pleasure of speaking with?
+- If customer name and vehicle found from lookup_customer: {first_name}, welcome back to Woodbine Toyota. What service would you like for your {year} {model}? and Proceed to Step 3
+- If only customer name found from lookup_customer: {first_name}, welcome back to Woodbine Toyota. What is your car's year, make, and model? and Proceed to Step 2
+- If customer name not found: Hello! you reached Woodbine Toyota Service. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
     If first name or last name not captured: What is the spelling of your first name / last name?
-- Do not use "Mr." or "Mrs."
 
 Step 2. Gather vehicle year make and model
-- Once both first name and last name captured, Ask for the vehicle's year make and model, for example, 2025 Toyota Camry?
-- call save_customer_information tool.
+- Once both first name and last name captured, Ask for the vehicle's year make and model? for example, 2025 Toyota Camry
+- call save_customer_information tool
 
 Step 3. Gather services
 - Once Year Make and Model are captured, Ask for services needed for the vehicle, e.g. oil change, diagnostics, repairs:
-    For oil change, ask if user needs a cabin air filter replacement or a tire rotatio
+    If oil change, ask if user needs a cabin air filter replacement or a tire rotation
+    If maintenance, first service or general service: Set is_maintenance to 1
 
 Step 4. Gather transportation
 - Once year make and model captured: Ask if user will be dropping off the vehicle or waiting while we do the work.
-
-- If services includes maintenance, first service or general service: Set is_maintenance to 1
 - call save_services_detail tool
 
 Step 5. Gather mileage
-- Once services captured, Ask what is the mileage.
+- Once services captured, Ask what is the mileage
 
 Step 6. Offer first availability
 - offer the first availability and ask if that will work, or if the user has a specific time
 
 Step 7. Find availability
-On response, offer the first availability and ask if that will work, or if the user has a specific time:
-    If first availability works, book it
+If first availability works for user, book it
+Else:
+    If user provides a period, ask for a date and time
+    Once date and time captured:
+    If found availability, book it
     Else:
-        If user provides a period, ask for a date and time
-        Once date and time captured:
-        If found availability, book it
-        Else:
-           Offer 3 available times and repeat till user finds availability.
-               If availability is found, confirm with: Just to be sure, you would like to book ...
-        On book:
-            Inform the user they will receive an email or text confirmation shortly.
-            Trigger tool name create_appointment.""",
-        )
+        Offer 3 available times and repeat till user finds availability.
+            If availability is found, confirm with: Just to be sure, you would like to book ...
+    On book:
+        Inform the user they will receive an email or text confirmation shortly.
+        Trigger tool name create_appointment.""",
+    )
         
         # In-memory storage for customer data and appointments
         self.customer_data = {
@@ -497,7 +493,7 @@ async def entrypoint(ctx: JobContext):
             api_key="59bb59df13287e23ba2da37ea6e48724",
             voice_settings= VoiceSettings(
                 similarity_boost=0.4,
-                speed=0.9,
+                speed=0.94,
                 stability=0.3,
                 style=1,
                 use_speaker_boost=True

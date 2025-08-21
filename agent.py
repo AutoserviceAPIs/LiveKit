@@ -222,7 +222,6 @@ Else:
         
         # Flag to track if appointment was created
         self.appointment_created = False
-        self.num_timeouts = 0
 
     def _generate_available_slots(self) -> Dict[str, List[str]]:
         """Generate available time slots for the next 2 weeks"""
@@ -591,6 +590,7 @@ async def entrypoint(ctx: JobContext):
     # Add timeout handler for user silence
     TIMEOUT_SECONDS  = 10  # Configurable timeout
     timeout_task     = None
+    num_timeouts     = 0   # Num of back-to-back timesouts 
 
 
     def getReprompt():
@@ -608,9 +608,9 @@ async def entrypoint(ctx: JobContext):
 
     
     async def timeout_handler():
-        nonlocal self
         """If second timeout in a row transfer call"""
-        if self.num_timeouts > 1:
+        nonlocal num_timeouts
+        if num_timeouts > 1:
             logger.info(f"User timeout detected twice in a row, transfer call")        
             transfer_call
         else:
@@ -622,23 +622,23 @@ async def entrypoint(ctx: JobContext):
             )
     
     def start_timeout():
-        nonlocal self
         """Start a new timeout task"""
+        nonlocal num_timeouts
         nonlocal timeout_task
         if timeout_task and not timeout_task.done():
             timeout_task.cancel()
         timeout_task = asyncio.create_task(timeout_handler())
         logger.info(f"Timeout started for {TIMEOUT_SECONDS}s")
-        self.num_timeouts = self.num_timeouts + 1 
+        num_timeouts = num_timeouts + 1 
     
     def cancel_timeout():
-        nonlocal self
         """Cancel the current timeout task"""
+        nonlocal num_timeouts
         nonlocal timeout_task
         if timeout_task and not timeout_task.done():
             timeout_task.cancel()
             logger.info("Timeout cancelled")
-            self.num_timeouts = 0
+            num_timeouts = 0
     
     async def delayed_timeout_start(audio_duration):
         """Start timeout after audio finishes playing"""

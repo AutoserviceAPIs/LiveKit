@@ -134,7 +134,7 @@ Step 2. Gather vehicle year make and model
 - call save_customer_information tool
 
 Step 3. Gather services
-- Ask what services are needed for the vehicle, e.g. oil change, diagnostics, repairs:
+- Ask what services are needed for the vehicle, for example oil change, diagnostics, repairs:
 - Proceed to Step 4
 
 Step 4. Gather transportation
@@ -625,31 +625,26 @@ async def entrypoint(ctx: JobContext):
         reprompt = "instructions=Repeat please"
         if current_action == "get name":
             reprompt = "instructions=Whenever you are ready, please tell me what is your first and last name?"
-            return
         if current_action == "get service":
             reprompt = "instructions=Are u still there {first_name}, Can u please tell me what service you desire for your vehicle?"
-            return
         if current_action == "first availability":
             reprompt = "instructions=ask if user is still there. repeat availability"
-            return
         if current_action == "check availability":
             reprompt = "instructions=ask if user is still there. repeat availability"
-            return
         """current_action get ymm should be implemented later"""
         if current_action == "get ymm":
             reprompt = "instructions=Just checking in {first_name}. Are u still there, Can u please tell me your car's Year Make and Model?"
-            return
         """current_action get transportation should be implemented later"""
         if current_action == "get transportation":
             reprompt = "instructions=Are u still there <FName>, Can u please tell me if you desire to drop off your vehicle or wait at the dealership?"
-            return        
-        logger.info(f"Reprompt instructions= {reprompt}")        
+        logger.info(f"Reprompt instructions= {reprompt} - Current_action= {current_action}")        
         return reprompt
 
     
     async def timeout_handler():
         """If second timeout in a row transfer call"""
         nonlocal num_timeouts
+        logger.info(f"*****timeout_handler - num_timeouts= {num_timeouts}")       
         if num_timeouts > 1:
             logger.info(f"User timeout detected twice in a row, transfer call")
             """Hard coded values for now"""
@@ -666,6 +661,7 @@ async def entrypoint(ctx: JobContext):
         """Start a new timeout task"""
         nonlocal num_timeouts
         nonlocal timeout_task
+        logger.info(f"*****start_timeout - num_timeouts= {num_timeouts}")       
         if timeout_task and not timeout_task.done():
             timeout_task.cancel()
         timeout_task = asyncio.create_task(timeout_handler())
@@ -676,6 +672,7 @@ async def entrypoint(ctx: JobContext):
         """Cancel the current timeout task"""
         nonlocal num_timeouts
         nonlocal timeout_task
+        logger.info(f"*****cancel_timeout - num_timeouts= {num_timeouts}")       
         if timeout_task and not timeout_task.done():
             timeout_task.cancel()
             logger.info("Timeout cancelled")
@@ -683,6 +680,7 @@ async def entrypoint(ctx: JobContext):
     
     async def delayed_timeout_start(audio_duration):
         """Start timeout after audio finishes playing"""
+        logger.info(f"*****delayed_timeout_start - num_timeouts= {num_timeouts}")       
         await asyncio.sleep(audio_duration + 0.5)  # Wait for audio to finish + buffer
         start_timeout()
         logger.info(f"Timeout started after {audio_duration}s audio finished")

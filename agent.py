@@ -269,10 +269,7 @@ Else:
             print(f"Call for participant {participant_identity} successfully transferred to {transfer_to_number}")
         except Exception as e:
             print(f"Error transferring call: {e}")
-    
-    # Example usage within another function or event handler:
-    # await transfer_call_function("participant_id_123", "+15551234567")
-
+        return
     
     @function_tool
     async def transfer_call(self, context: RunContext) -> str:
@@ -654,10 +651,9 @@ async def entrypoint(ctx: JobContext):
         """If second timeout in a row transfer call"""
         nonlocal num_timeouts
         if num_timeouts > 1:
-            logger.info(f"User timeout detected twice in a row, transfer call")        
-            await session.generate_reply(
-                instructions = "call transfer_call tool"
-            )
+            logger.info(f"User timeout detected twice in a row, transfer call")
+            """Hard coded values for now"""
+            transfer_call_function(0, "6506905516")
         else:
             """Handle timeout when user doesn't respond"""
             await asyncio.sleep(TIMEOUT_SECONDS)

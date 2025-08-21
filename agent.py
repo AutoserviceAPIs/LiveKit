@@ -222,6 +222,7 @@ Else:
         
         # Flag to track if appointment was created
         self.appointment_created = False
+        self.num_timeouts = 0
 
     def _generate_available_slots(self) -> Dict[str, List[str]]:
         """Generate available time slots for the next 2 weeks"""
@@ -395,6 +396,10 @@ Else:
         This function is called when the user wants to speak with a human agent.
         """
         logger.info("Transferring call to human agent")
+        await session.say(
+           "Please wait while I transfer your call to an agent",
+           allow_interruptions=False,
+        )
         
         # In a real implementation, this would initiate a call transfer
         # For now, we'll just return a message
@@ -502,9 +507,7 @@ Else:
         except Exception as error:
             logger.error(f"Customer lookup error: {error}")
             return False
-
-
-
+            
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
@@ -546,9 +549,12 @@ async def entrypoint(ctx: JobContext):
 
     @session.on("user_state_changed")
     def _on_user_state_changed(ev: UserStateChangedEvent):
-        logger.info(f"User state changed: {ev.new_state}")
-        if ev.new_state == "speaking" or ev.new_state == "away":  
+        if ev.new_state == "speaking":  
             cancel_timeout()
+            logger.info(f"User state changed: {ev.new_state} - Cancel Timeout")
+        if ev.new_state == "away":  
+            start_timeout()
+            logger.info(f"User state changed: {ev.new_state} - Restart Timeout")
 
     # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
     # when it's detected, you may resume the agent's speech
@@ -583,16 +589,36 @@ async def entrypoint(ctx: JobContext):
                 asyncio.create_task(delayed_timeout_start(audio_duration))
     
     # Add timeout handler for user silence
-    TIMEOUT_SECONDS = 10  # Configurable timeout
-    timeout_task = None
+    TIMEOUT_SECONDS  = 10  # Configurable timeout
+    timeout_task     = None
+
+
+    def getReprompt():
+        reprompt = "instructions=Repeat please"
+        if self.customer_data["first_name"] == "":
+            reprompt = "instructions=Whenever you are ready, please tell me what is your first and last name?"
+            if self.customer_data["car_model"] == "":
+                reprompt = "instructions=Just checking in {first_name}. Are u still there, Can u please tell me your car's Year Make and Model?"
+                if self.customer_data["services_transcript"] == "":
+                    reprompt = "instructions=Are u still there {first_name}, Can u please tell me what service you desire for your vehicle?"
+                    if self.customer_data["transportation"] == "":
+                        reprompt = "instructions=Are u still there <FName>, Can u please tell me if you desire to drop off your vehicle or wait at the dealership? "        
+        logger.info(f"Reprompt instructions= {reprompt}")        
+        return reprompt
+        
     
     async def timeout_handler():
-        """Handle timeout when user doesn't respond"""
-        await asyncio.sleep(TIMEOUT_SECONDS)
-        logger.info(f"User timeout after {TIMEOUT_SECONDS}s, triggering follow-up")
-        await session.generate_reply(
-            instructions="Repeat please"
-        )
+        """If second timeout in a row transfer call"""
+        if self.num_timeouts > 1:
+            logger.info(f"User timeout detected twice in a row, transfer call")        
+            transfer_call
+        else:
+            """Handle timeout when user doesn't respond"""
+            await asyncio.sleep(TIMEOUT_SECONDS)
+            logger.info(f"User timeout after {TIMEOUT_SECONDS}s, triggering follow-up")       
+            await session.generate_reply(
+                instructions =getReprompt()
+            )
     
     def start_timeout():
         """Start a new timeout task"""
@@ -601,6 +627,7 @@ async def entrypoint(ctx: JobContext):
             timeout_task.cancel()
         timeout_task = asyncio.create_task(timeout_handler())
         logger.info(f"Timeout started for {TIMEOUT_SECONDS}s")
+        self.num_timeouts = self.num_timeouts + 1 
     
     def cancel_timeout():
         """Cancel the current timeout task"""
@@ -608,6 +635,7 @@ async def entrypoint(ctx: JobContext):
         if timeout_task and not timeout_task.done():
             timeout_task.cancel()
             logger.info("Timeout cancelled")
+            self.num_timeouts = 0
     
     async def delayed_timeout_start(audio_duration):
         """Start timeout after audio finishes playing"""

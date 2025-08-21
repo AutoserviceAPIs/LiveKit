@@ -548,12 +548,12 @@ async def entrypoint(ctx: JobContext):
     )
 
     @session.on("user_state_changed")
-    def _on_user_state_changed(self, ev: UserStateChangedEvent):
+    def _on_user_state_changed(ev: UserStateChangedEvent):
         if ev.new_state == "speaking":  
-            cancel_timeout(self)
+            cancel_timeout()
             logger.info(f"User state changed: {ev.new_state} - Cancel Timeout")
         if ev.new_state == "away":  
-            start_timeout(self)
+            start_timeout()
             logger.info(f"User state changed: {ev.new_state} - Restart Timeout")
 
     # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
@@ -568,7 +568,7 @@ async def entrypoint(ctx: JobContext):
     usage_collector = metrics.UsageCollector()
 
     @session.on("metrics_collected")
-    def _on_metrics_collected(self, ev: MetricsCollectedEvent):
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
         
@@ -586,7 +586,7 @@ async def entrypoint(ctx: JobContext):
             # Start timeout after audio duration finishes
             audio_duration = ev.metrics.audio_duration
             if audio_duration > 0:
-                asyncio.create_task(delayed_timeout_start(self, audio_duration))
+                asyncio.create_task(delayed_timeout_start(audio_duration))
     
     # Add timeout handler for user silence
     TIMEOUT_SECONDS  = 10  # Configurable timeout
@@ -605,9 +605,10 @@ async def entrypoint(ctx: JobContext):
                         reprompt = "instructions=Are u still there <FName>, Can u please tell me if you desire to drop off your vehicle or wait at the dealership? "        
         logger.info(f"Reprompt instructions= {reprompt}")        
         return reprompt
-        
+
     
-    async def timeout_handler(self):
+    async def timeout_handler():
+        nonlocal self
         """If second timeout in a row transfer call"""
         if self.num_timeouts > 1:
             logger.info(f"User timeout detected twice in a row, transfer call")        
@@ -620,16 +621,18 @@ async def entrypoint(ctx: JobContext):
                 instructions =getReprompt()
             )
     
-    def start_timeout(self):
+    def start_timeout():
+        nonlocal self
         """Start a new timeout task"""
         nonlocal timeout_task
         if timeout_task and not timeout_task.done():
             timeout_task.cancel()
-        timeout_task = asyncio.create_task(timeout_handler(self))
+        timeout_task = asyncio.create_task(timeout_handler())
         logger.info(f"Timeout started for {TIMEOUT_SECONDS}s")
         self.num_timeouts = self.num_timeouts + 1 
     
-    def cancel_timeout(self):
+    def cancel_timeout():
+        nonlocal self
         """Cancel the current timeout task"""
         nonlocal timeout_task
         if timeout_task and not timeout_task.done():
@@ -637,10 +640,10 @@ async def entrypoint(ctx: JobContext):
             logger.info("Timeout cancelled")
             self.num_timeouts = 0
     
-    async def delayed_timeout_start(self,audio_duration):
+    async def delayed_timeout_start(audio_duration):
         """Start timeout after audio finishes playing"""
         await asyncio.sleep(audio_duration + 0.5)  # Wait for audio to finish + buffer
-        start_timeout(self)
+        start_timeout()
         logger.info(f"Timeout started after {audio_duration}s audio finished")
 
     async def delayed_hangup(ctx, delay):

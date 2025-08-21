@@ -1,3 +1,7 @@
+#Issue: timeout_handler, after 20s of silence, expected: transfer_to_number. found: no transfer log
+#Added transfer_to_number (not completed)
+#Added stop_background (when transfer to person)
+
 import logging
 import aiohttp
 from datetime import datetime, timedelta
@@ -37,6 +41,15 @@ from livekit import rtc
 
 # State
 current_action = "get name"
+#Prevents multiple transfers
+call_already_transferred = False
+# Keep references so we can stop later
+_background_state = {
+    "process": None,
+    "task": None,
+    "track": None,
+    "source": None,
+}
 
 # Extract phone number from room name
 def extract_phone_from_room_name(room_name: str) -> str:
@@ -73,6 +86,7 @@ async def publish_background(room: rtc.Room, file_path: str):
         stderr=subprocess.DEVNULL,
     )
 
+    logger.info("Start background sound")
     # tạo audio source + track
     source = rtc.AudioSource(48000, 1)
     track = rtc.LocalAudioTrack.create_audio_track("background", source)
@@ -97,7 +111,25 @@ async def publish_background(room: rtc.Room, file_path: str):
             await source.capture_frame(frame)
             await asyncio.sleep(0.02)
 
-    asyncio.create_task(read_audio())
+    task = asyncio.create_task(read_audio())
+    #Added so that can stop background audio in transfer_call
+    _background_state.update(
+        {"process": process, "task": task, "track": track, "source": source}
+    )
+
+async def stop_background(room: rtc.Room):
+    global _background_state
+
+    logger.info("Stop background sound")
+    if _background_state["task"]:
+        _background_state["task"].cancel()
+    if _background_state["process"]:
+        _background_state["process"].kill()
+    if _background_state["track"]:
+        await room.local_participant.unpublish_track(_background_state["track"])
+        await _background_state["track"].stop()
+
+    _background_state = {"process": None, "task": None, "track": None, "source": None}
 
 class AutomotiveBookingAssistant(Agent):
     def __init__(self) -> None:
@@ -134,21 +166,24 @@ Step 2. Gather vehicle year make and model
 - call save_customer_information tool
 
 Step 3. Gather services
-- Ask what services are needed for the vehicle, for example oil change, diagnostics, repairs:
-- Proceed to Step 4
+- Ask what services are needed for the vehicle, for example oil change, diagnostics, repairs
+- Wait for services
+- Must go to Step 4 before Step 5
 
 Step 4. Gather transportation
-- Ask if user will be dropping off the vehicle or waiting while we do the work.
-- call save_services_detail tool
-- Proceed to Step 5
+- After capture services, Ask if user will be dropping off the vehicle or waiting while we do the work
+- Wait for transportation
+- After services and transportation captured, call save_services_detail tool
+- Must go to Step 5 before Step 6
 
 Step 5. Gather mileage
 - Once transportation captured, Ask what is the mileage
-    - If do not know, proceed to Step 6
-- call check_available_slots tool
+    - Wait for response
+        - If do not know, proceed to Step 6
+- After transportation captured, call check_available_slots tool
 
 Step 6. Offer first availability
-- After response, offer the first availability and ask if that will work, or if the user has a specific time
+- After services, transportation captured: offer the first availability and ask if that will work, or if the user has a specific time
 
 Step 7. Find availability
 If first availability works for user, book it
@@ -256,11 +291,17 @@ Else:
         return slots
 
 
-    async def transfer_call_function(participant_identity: str, transfer_to_number: str):
+    async def transfer_to_number():
         """
         Transfers a LiveKit SIP call to another number.
         """
+        logger.info("Transferring call to human agent")
+        if call_already_transferred:
+            return
+        call_already_transferred = true
         try:
+            # Stop background noise
+            stop_background()
             # Assuming you have a LiveKit client instance available
             await livekit_client.transfer_sip_participant(
                 participant_identity=participant_identity,
@@ -282,6 +323,8 @@ Else:
            "Please wait while I transfer your call to an agent",
            allow_interruptions=False,
         )
+
+        transfer_to_number()
         
         # In a real implementation, this would initiate a call transfer
         # For now, we'll just return a message
@@ -438,7 +481,7 @@ Else:
         Args:
             phone: Customer's phone number
         """
-        logger.info(f"Looking up customer with phone: {phone}")
+        logger.info(f"Looking up customer in")
         
         # Check if customer data is already populated
         if (self.customer_data["first_name"] and 
@@ -457,7 +500,6 @@ Else:
                 "year": self.customer_data["car_year"],
                 "message": f"Found customer record with name: {self.customer_data['first_name']} {self.customer_data['last_name']} with car {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}"                
             }
-            current_action = "get service"
             # Store the lookup result for later use
             return json.dumps(result)
         else:
@@ -478,6 +520,7 @@ Else:
         Args:
             phone: Customer's phone number
         """
+        logger.info(f"---FindCustomer with phone: {phone}")
         try:
             # Get last 10 digits of phone number
             clean_phone = ''.join(filter(str.isdigit, phone))
@@ -622,68 +665,72 @@ async def entrypoint(ctx: JobContext):
 
 
     def getReprompt():
+        logger.info(f"getReprompt - Current_action= {current_action}")        
         reprompt = "instructions=Repeat please"
         if current_action == "get name":
-            reprompt = "instructions=Whenever you are ready, please tell me what is your first and last name?"
+            reprompt = "Say: Whenever you are ready, please tell me what is your first and last name?"
         if current_action == "get service":
-            reprompt = "instructions=Are u still there {first_name}, Can u please tell me what service you desire for your vehicle?"
+            reprompt = "Say: Are u still there {first_name}, would you like an oil change?"
         if current_action == "first availability":
-            reprompt = "instructions=ask if user is still there. repeat availability"
+            reprompt = "Ask if user is still there. repeat availability"
         if current_action == "check availability":
-            reprompt = "instructions=ask if user is still there. repeat availability"
+            reprompt = "Ask if user is still there. repeat availability"
         """current_action get ymm should be implemented later"""
         if current_action == "get ymm":
-            reprompt = "instructions=Just checking in {first_name}. Are u still there, Can u please tell me your car's Year Make and Model?"
+            reprompt = "Say: Just checking in {first_name}. Are u still there, Can u please tell me your car's Year Make and Model?"
         """current_action get transportation should be implemented later"""
         if current_action == "get transportation":
-            reprompt = "instructions=Are u still there <FName>, Can u please tell me if you desire to drop off your vehicle or wait at the dealership?"
-        logger.info(f"Reprompt instructions= {reprompt} - Current_action= {current_action}")        
+            reprompt = "Say: Are u still there <FName>, Can u please tell me if you desire to drop off your vehicle or wait at the dealership?"
+        logger.info(f"Reprompt instructions= {reprompt}")        
         return reprompt
 
     
     async def timeout_handler():
         """If second timeout in a row transfer call"""
         nonlocal num_timeouts
-        logger.info(f"*****timeout_handler - num_timeouts= {num_timeouts}")       
+        logger.info(f"*****timeout_handler - num_timeouts= {num_timeouts} - current_action: {current_action}")       
         if num_timeouts > 1:
-            logger.info(f"User timeout detected twice in a row, transfer call")
+            logger.info(f"User timeout detected {num_timeouts} times in a row, transfer_to_number")
             """Hard coded values for now"""
-            transfer_call_function(0, "6506905516")
-        else:
-            """Handle timeout when user doesn't respond"""
-            await asyncio.sleep(TIMEOUT_SECONDS)
+            transfer_to_number()
+            return
+
+        """Handle timeout when user doesn't respond"""
+        await asyncio.sleep(TIMEOUT_SECONDS)
+
+        """Send reprompt only 1 time"""
+        if num_timeouts == 0:
             logger.info(f"User timeout after {TIMEOUT_SECONDS}s, triggering follow-up")       
             await session.generate_reply(
-                instructions =getReprompt()
+                instructions=getReprompt()
             )
+        
+        num_timeouts = num_timeouts + 1 
+
     
     def start_timeout():
         """Start a new timeout task"""
         nonlocal num_timeouts
         nonlocal timeout_task
-        logger.info(f"*****start_timeout - num_timeouts= {num_timeouts}")       
         if timeout_task and not timeout_task.done():
             timeout_task.cancel()
         timeout_task = asyncio.create_task(timeout_handler())
-        logger.info(f"Timeout started for {TIMEOUT_SECONDS}s")
-        num_timeouts = num_timeouts + 1 
+        logger.info(f"---Timeout started for: {TIMEOUT_SECONDS}s - previous num_timeouts: {num_timeouts}")
     
     def cancel_timeout():
         """Cancel the current timeout task"""
         nonlocal num_timeouts
         nonlocal timeout_task
-        logger.info(f"*****cancel_timeout - num_timeouts= {num_timeouts}")       
         if timeout_task and not timeout_task.done():
             timeout_task.cancel()
-            logger.info("Timeout cancelled")
-            num_timeouts = 0
-    
+            logger.info("---Timeout cancelled - previous num_timeouts: {num_timeouts}")
+        num_timeouts = 0
+
     async def delayed_timeout_start(audio_duration):
         """Start timeout after audio finishes playing"""
-        logger.info(f"*****delayed_timeout_start - num_timeouts= {num_timeouts}")       
         await asyncio.sleep(audio_duration + 0.5)  # Wait for audio to finish + buffer
         start_timeout()
-        logger.info(f"Timeout started after {audio_duration}s audio finished")
+        logger.info(f"Timeout started after {audio_duration}s audio finished - num_timeouts= {num_timeouts}")
 
     async def delayed_hangup(ctx, delay):
         """Hangup after calculated delay based on audio duration"""
@@ -698,7 +745,7 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"Error hanging up SIP call: {e}")
         
         # Then shutdown the agent
-        logger.info("Appointment created successfully, shutting down agent")
+        logger.info("Shutting down agent")
         ctx.shutdown(reason="Appointment created successfully")
 
     async def log_usage():
@@ -718,7 +765,8 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"Attempting to find customer with phone: {phone_number}")
         found = await agent.findCustomer(phone_number)
         if found:
-            logger.info("Customer found and data populated")
+            current_action = "get service"
+            logger.info(f"Customer found and data populated - current_action: {current_action}")
         else:
             logger.info("Customer not found, will proceed with normal flow")
     

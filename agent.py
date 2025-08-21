@@ -35,6 +35,9 @@ import asyncio
 import subprocess
 from livekit import rtc
 
+# State
+current_action = "get name"
+
 # Extract phone number from room name
 def extract_phone_from_room_name(room_name: str) -> str:
     """Extract phone number from room name format: call-_8055057710_uHsvtynDWWJN"""
@@ -115,6 +118,8 @@ class AutomotiveBookingAssistant(Agent):
 - For address: "80 Queens Plate Dr, Etobicoke"
 - For price: "oil change starts at $130 plus tax"
 - For Wait time: "45 minutes to 1 hour"
+- If service is oil change, ask if user needs a cabin air filter replacement or a tire rotation
+- If maintenance, first service or general service: Set is_maintenance to 1
 
 ## Follow this conversation flow:
 
@@ -129,19 +134,18 @@ Step 2. Gather vehicle year make and model
 - call save_customer_information tool
 
 Step 3. Gather services
-- Once Year Make and Model are captured, Ask what services are needed for the vehicle, e.g. oil change, diagnostics, repairs:
-    If oil change, ask if user needs a cabin air filter replacement or a tire rotation
-    If maintenance, first service or general service: Set is_maintenance to 1
+- Ask what services are needed for the vehicle, e.g. oil change, diagnostics, repairs:
 - Proceed to Step 4
 
 Step 4. Gather transportation
-- Once year make and model captured: Ask if user will be dropping off the vehicle or waiting while we do the work.
+- Ask if user will be dropping off the vehicle or waiting while we do the work.
 - call save_services_detail tool
 - Proceed to Step 5
 
 Step 5. Gather mileage
 - Once transportation captured, Ask what is the mileage
     - If do not know, proceed to Step 6
+- call check_available_slots tool
 
 Step 6. Offer first availability
 - After response, offer the first availability and ask if that will work, or if the user has a specific time
@@ -251,6 +255,41 @@ Else:
         
         return slots
 
+
+    async def transfer_call_function(participant_identity: str, transfer_to_number: str):
+        """
+        Transfers a LiveKit SIP call to another number.
+        """
+        try:
+            # Assuming you have a LiveKit client instance available
+            await livekit_client.transfer_sip_participant(
+                participant_identity=participant_identity,
+                transfer_to=transfer_to_number
+            )
+            print(f"Call for participant {participant_identity} successfully transferred to {transfer_to_number}")
+        except Exception as e:
+            print(f"Error transferring call: {e}")
+    
+    # Example usage within another function or event handler:
+    # await transfer_call_function("participant_id_123", "+15551234567")
+
+    
+    @function_tool
+    async def transfer_call(self, context: RunContext) -> str:
+        """Transfer call to human agent when user requested.
+        
+        This function is called when the user wants to speak with a human agent.
+        """
+        logger.info("Transferring call to human agent")
+        await session.say(
+           "Please wait while I transfer your call to an agent",
+           allow_interruptions=False,
+        )
+        
+        # In a real implementation, this would initiate a call transfer
+        # For now, we'll just return a message
+        return "I'm transferring you to a human agent. Please hold on."
+
     @function_tool
     async def save_customer_information(self, context: RunContext, first_name: str, last_name: str, 
                                       car_make: str, car_model: str, car_year: str) -> str:
@@ -270,6 +309,8 @@ Else:
         self.customer_data["car_make"] = car_make
         self.customer_data["car_model"] = car_model
         self.customer_data["car_year"] = car_year
+
+        current_action = "get service"
         
         return "Customer information saved successfully."
 
@@ -307,7 +348,9 @@ Else:
             
             if date_str in self.available_slots:
                 available_slots[date_str] = self.available_slots[date_str]
-        
+
+        current_action = "first availability"
+                                     
         return f"Service details saved. Available slots for next 7 days: {json.dumps(available_slots)}"
 
     @function_tool
@@ -331,6 +374,9 @@ Else:
             result = {}
             for date in available_dates:
                 result[date] = self.available_slots[date]
+
+            current_action = "check availability"
+
             return f"Next available dates: {json.dumps(result)}"
 
     @function_tool
@@ -389,22 +435,6 @@ Else:
         return f"Appointment confirmed! Your appointment ID is {appointment_id}. You have service scheduled for {selected_date} at {selected_time}. We'll send a confirmation message shortly. Have a great day!"
 
     @function_tool
-    async def transfer_call(self, context: RunContext) -> str:
-        """Transfer call to human agent when user requested.
-        
-        This function is called when the user wants to speak with a human agent.
-        """
-        logger.info("Transferring call to human agent")
-        await session.say(
-           "Please wait while I transfer your call to an agent",
-           allow_interruptions=False,
-        )
-        
-        # In a real implementation, this would initiate a call transfer
-        # For now, we'll just return a message
-        return "I'm transferring you to a human agent. Please hold on."
-
-    @function_tool
     async def lookup_customer(self, context: RunContext, phone: str) -> str:
         """Look up customer information by phone number.
         
@@ -428,8 +458,9 @@ Else:
                 "make": self.customer_data["car_make"],
                 "model": self.customer_data["car_model"],
                 "year": self.customer_data["car_year"],
-                "message": f"Found customer record with name: {self.customer_data['first_name']} {self.customer_data['last_name']} with car {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}"
+                "message": f"Found customer record with name: {self.customer_data['first_name']} {self.customer_data['last_name']} with car {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}"                
             }
+            current_action = "get service"
             # Store the lookup result for later use
             return json.dumps(result)
         else:
@@ -595,14 +626,26 @@ async def entrypoint(ctx: JobContext):
 
     def getReprompt():
         reprompt = "instructions=Repeat please"
-        if self.customer_data["first_name"] == "":
+        if current_action == "get name":
             reprompt = "instructions=Whenever you are ready, please tell me what is your first and last name?"
-            if self.customer_data["car_model"] == "":
-                reprompt = "instructions=Just checking in {first_name}. Are u still there, Can u please tell me your car's Year Make and Model?"
-                if self.customer_data["services_transcript"] == "":
-                    reprompt = "instructions=Are u still there {first_name}, Can u please tell me what service you desire for your vehicle?"
-                    if self.customer_data["transportation"] == "":
-                        reprompt = "instructions=Are u still there <FName>, Can u please tell me if you desire to drop off your vehicle or wait at the dealership? "        
+            return
+        if current_action == "get service":
+            reprompt = "instructions=Are u still there {first_name}, Can u please tell me what service you desire for your vehicle?"
+            return
+        if current_action == "first availability":
+            reprompt = "instructions=ask if user is still there. repeat availability"
+            return
+        if current_action == "check availability":
+            reprompt = "instructions=ask if user is still there. repeat availability"
+            return
+        """current_action get ymm should be implemented later"""
+        if current_action == "get ymm":
+            reprompt = "instructions=Just checking in {first_name}. Are u still there, Can u please tell me your car's Year Make and Model?"
+            return
+        """current_action get transportation should be implemented later"""
+        if current_action == "get transportation":
+            reprompt = "instructions=Are u still there <FName>, Can u please tell me if you desire to drop off your vehicle or wait at the dealership?"
+            return        
         logger.info(f"Reprompt instructions= {reprompt}")        
         return reprompt
 
@@ -612,7 +655,9 @@ async def entrypoint(ctx: JobContext):
         nonlocal num_timeouts
         if num_timeouts > 1:
             logger.info(f"User timeout detected twice in a row, transfer call")        
-            transfer_call
+            await session.generate_reply(
+                instructions = "call transfer_call tool"
+            )
         else:
             """Handle timeout when user doesn't respond"""
             await asyncio.sleep(TIMEOUT_SECONDS)

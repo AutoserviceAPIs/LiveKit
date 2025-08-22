@@ -445,16 +445,17 @@ Else:
         """
         Transfers a LiveKit SIP call to another number.
         """
-        logger.info("Transferring call to human agent")
         if self._call_already_transferred:
             return
         self._call_already_transferred = True
         try:
+            logger.info("Transferring call to human agent")
             # Stop background noise
-            self.stop_background()
+            ctx = get_job_context()
+            await self.stop_background(ctx.room)
 
             await self._session_ref.say(
-               "Please wait while I transfer your call to an agent",
+               "Please wait while I transfer your call to an agent"
             )
 
             # Assuming you have a LiveKit client instance available
@@ -462,9 +463,9 @@ Else:
                 participant_identity=participant_identity,
                 transfer_to=transfer_to_number
             )
-            print(f"Call for participant {participant_identity} successfully transferred to {transfer_to_number}")
+            logger.info(f"Call for participant {participant_identity} transferred to {transfer_to_number}")
         except Exception as e:
-            print(f"Error transferring call: {e}")
+            logger.exception(f"Error transferring call: {e}")
         return
     
     @function_tool
@@ -477,8 +478,6 @@ Else:
 
         transfer_to_number(self)
         
-        # In a real implementation, this would initiate a call transfer
-        # For now, we'll just return a message
         return "I'm transferring you to a human agent. Please hold on."
 
     @function_tool

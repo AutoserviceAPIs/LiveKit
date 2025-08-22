@@ -258,7 +258,7 @@ Else:
     async def timeout_handler(self):
         """If second timeout in a row transfer call"""
         logger.info(f"*****timeout_handler - num_timeouts= {self._num_timeouts}")       
-        if self._num_timeouts > 1:
+        if self._num_timeouts > 0:
             logger.info(f"User timeout detected {self._num_timeouts} times in a row, transfer_to_number")
             """Hard coded values for now"""
             transfer_to_number()

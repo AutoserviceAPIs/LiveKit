@@ -261,7 +261,7 @@ Else:
         if self._num_timeouts > 0:
             logger.info(f"User timeout detected {self._num_timeouts} times in a row, transfer_to_number")
             """Hard coded values for now"""
-            transfer_to_number()
+            await self.transfer_to_number()
             return
 
         """Handle timeout when user doesn't respond"""
@@ -451,7 +451,12 @@ Else:
         self._call_already_transferred = True
         try:
             # Stop background noise
-            stop_background()
+            self.stop_background()
+
+            await self._session_ref.say(
+               "Please wait while I transfer your call to an agent",
+            )
+
             # Assuming you have a LiveKit client instance available
             await livekit_client.transfer_sip_participant(
                 participant_identity=participant_identity,
@@ -469,10 +474,6 @@ Else:
         This function is called when the user wants to speak with a human agent.
         """
         logger.info("Transferring call to human agent")
-        await self._session_ref.say(
-           "Please wait while I transfer your call to an agent",
-           allow_interruptions=False,
-        )
 
         transfer_to_number(self)
         

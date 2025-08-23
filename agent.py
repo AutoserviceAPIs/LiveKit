@@ -31,14 +31,16 @@ from livekit.agents.metrics import TTSMetrics
 
 from livekit import api
 from livekit.protocol.sip import TransferSIPParticipantRequest
+from livekit.protocol import room as room_msgs  # ✅ protocol types live here
 from livekit.agents.llm import function_tool
 from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
 from livekit.plugins.elevenlabs import VoiceSettings
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit import agents
-logger = logging.getLogger("agent")
 
+logger = logging.getLogger("agent")
 load_dotenv(".env")
+
 import asyncio
 import subprocess
 from livekit import rtc
@@ -53,17 +55,44 @@ def extract_phone_from_room_name(room_name: str) -> str:
 
 # Add hangup_call function according to LiveKit documentation
 async def hangup_call():
+    """
+    Disconnect the PSTN/SIP caller. Prefer removing the SIP participant;
+    fall back to deleting the room (which disconnects everyone).
+    """
     ctx = get_job_context()
-    if ctx is None:
-        # Not running in a job context
+    if not ctx:
+        logger.warning("hangup_call(): no job context")
         return
-    
-    await ctx.api.room.delete_room(
-        api.DeleteRoomRequest(
-            room=ctx.room.name,
-        )
-    )
 
+    lk = ctx.api            # LiveKitAPI client provided by the job
+    room = ctx.room
+
+    # Log participants to make sure we target the SIP leg
+    for p in room.remote_participants.values():
+        logger.info("Remote participant: %s attrs=%s", p.identity, getattr(p, "attributes", {}))
+
+    removed_any = False
+    for p in list(room.remote_participants.values()):
+        attrs = getattr(p, "attributes", {}) or {}
+        if any(k.startswith("sip.") for k in attrs.keys()):
+            try:
+                await lk.room.remove_participant(
+                    room_msgs.RoomParticipantIdentity(room=room.name, identity=p.identity)  # ✅ correct type
+                )
+                logger.info("Removed SIP participant: %s", p.identity)
+                removed_any = True
+            except Exception as e:
+                logger.warning("remove_participant failed for %s: %s", p.identity, e)
+
+    if not removed_any:
+        try:
+            await lk.room.delete_room(  # ✅ this disconnects all participants
+                room_msgs.DeleteRoomRequest(room=room.name)
+            )
+            logger.info("Room deleted via delete_room()")
+        except Exception as e:
+            logger.warning("delete_room failed: %s", e)
+            
 
 class AutomotiveBookingAssistant(Agent):
     def __init__(self, session, ctx) -> None:
@@ -221,35 +250,37 @@ Else:
         logger.info(f"set_current_state - current_action: {status}")
 
     
+    async def _get_lk(self) -> api.LiveKitAPI:
+        if self._lk is None:
+            # Reads LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET from env
+            self._lk = api.LiveKitAPI(session=http_session())
+        return self._lk
+
+    
     async def delayed_timeout_start(self, audio_duration):
         """Start timeout after audio finishes playing"""
         await asyncio.sleep(audio_duration + 0.5)
         self.start_timeout()   # ✅ use self.start_timeout()
         logger.info(f"Timeout started after {audio_duration}s audio finished")
 
+    
     def start_timeout(self):
         """Start a new timeout task"""
         if self._timeout_task and not self._timeout_task.done():
             self._timeout_task.cancel()
         self._timeout_task = asyncio.create_task(self.timeout_handler())
         logger.info(f"---Timeout started for: {self.TIMEOUT_SECONDS}s")
+
     
-    async def delayed_hangup(ctx, delay):
-        """Hangup after calculated delay based on audio duration"""
-        await asyncio.sleep(delay)
+    async def delayed_hangup(self, delay: float):
+        await asyncio.sleep(max(0.0, delay))
         logger.info("Hanging up call after appointment creation")
-        
-        # Use LiveKit's proper hangup method to end call for all participants
         try:
             await hangup_call()
-            logger.info("SIP call hung up successfully - all participants disconnected")
-        except Exception as e:
-            logger.error(f"Error hanging up SIP call: {e}")
-        
-        # Then shutdown the agent
-        logger.info("Shutting down agent")
-        ctx.shutdown(reason="Appointment created successfully")
-
+            logger.info("SIP call hung up (participant removed / room deleted)")
+        finally:
+            logger.info("Shutting down agent")
+            self._ctx.shutdown(reason="Appointment created successfully")        
 
     def cancel_timeout(self):
         """Cancel the current timeout task"""
@@ -847,7 +878,7 @@ async def entrypoint(ctx: JobContext):
             if audio_duration > 0:
                 hangup_delay = audio_duration + 0.5  # Add 0.5s buffer
                 logger.info(f"TTS audio duration: {audio_duration}s, scheduling hangup in {hangup_delay}s")
-                asyncio.create_task(agent.delayed_hangup(ctx, hangup_delay))
+                asyncio.create_task(agent.delayed_hangup(hangup_delay))
         
         # Restart timeout after each TTS response (agent finished speaking)
         if isinstance(ev.metrics, TTSMetrics):

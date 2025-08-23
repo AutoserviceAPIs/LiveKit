@@ -73,7 +73,7 @@ class AutomotiveBookingAssistant(Agent):
 ## CUSTOMER LOOKUP:
 - At the beginning of the conversation, call lookup_customer function first (We already have customer phone number).
 - lookup_customer returns customer name, car details, or booking details.
-- trigger transfer_to_number tool
+
 ## RULES:
 - After collecting car year make and model: trigger save_customer_information tool
 - After collecting services and transportation: trigger save_services_detail tool

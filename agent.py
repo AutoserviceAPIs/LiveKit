@@ -262,7 +262,8 @@ Else:
     async def timeout_handler(self):
         """If second timeout in a row transfer call"""
         logger.info(f"*****timeout_handler - num_timeouts= {self._num_timeouts}")       
-        if self._num_timeouts > 0:
+        self._num_timeouts = self._num_timeouts + 1 
+        if self._num_timeouts > 2:
             logger.info(f"User timeout detected {self._num_timeouts} times in a row, transfer_to_number")
             """Hard coded values for now"""
             await self.transfer_to_number()
@@ -272,9 +273,8 @@ Else:
         await asyncio.sleep(self.TIMEOUT_SECONDS)
 
         """Send reprompt only 1 time"""
-        if self._num_timeouts == 0:
+        if self._num_timeouts == 1:
             logger.info(f"User timeout after {self.TIMEOUT_SECONDS}s, triggering follow-up")       
-            self._num_timeouts = self._num_timeouts + 1 
 
             if self._current_state == "get name":
                 reprompt = "Whenever you are ready, please tell me what is your first and last name?"

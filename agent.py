@@ -42,6 +42,7 @@ logger = logging.getLogger("agent")
 load_dotenv(".env")
 
 import asyncio
+import time
 import subprocess
 from livekit import rtc
 
@@ -95,6 +96,9 @@ async def hangup_call():
             
 
 class AutomotiveBookingAssistant(Agent):
+    TIMEOUT_SECONDS = 10
+    MAX_TIMEOUTS    = 3         # on the 3rd timeout -> transfer
+
     def __init__(self, session, ctx) -> None:
         super().__init__(
            instructions="""You are a receptionist for Woodbine Toyota. Help customers book appointments.
@@ -166,13 +170,15 @@ Else:
 
         # Globals
         # Add timeout handler for user silence
-        self.TIMEOUT_SECONDS           = 8  # Configurable timeout
         self._session_ref              = session      # keep session for say(), generate_reply(), etc
         self._ctx                      = ctx          # keep context for shutdown, logging, etc
-        self._current_state            = "get name"   # initialize conversation state
+        self._current_state            = getattr(self, "_current_state", None) or "get name"
         self._call_already_transferred = False        #Prevents multiple transfers
-        self._num_timeouts             = 0            # Num of back-to-back timesouts 
+        self._num_timeouts             = 0            # Num of back-to-back timesouts
         self._timeout_task             = None
+        self._timeout_gen              = 0            # increases every (re)start/cancel
+        self._num_timeouts             = 0
+        self._loop                     = None         # set on first async call
         self._sip_participant_identity = None         # Store SIP participant identity for transfer
         # Keep references so we can stop later
         self._background_state = {
@@ -250,6 +256,11 @@ Else:
         logger.info(f"set_current_state - current_action: {status}")
 
     
+    async def _ensure_loop(self):
+        if not self._loop or not self._loop.is_running():
+            self._loop = asyncio.get_running_loop()
+
+
     async def _get_lk(self) -> api.LiveKitAPI:
         if self._lk is None:
             # Reads LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET from env
@@ -268,8 +279,10 @@ Else:
         """Start a new timeout task"""
         if self._timeout_task and not self._timeout_task.done():
             self._timeout_task.cancel()
-        self._timeout_task = asyncio.create_task(self.timeout_handler())
-        logger.info(f"---Timeout started for: {self.TIMEOUT_SECONDS}s")
+        self._timeout_gen += 1 
+        gen = self._timeout_gen
+        self._timeout_task = asyncio.create_task(self.timeout_handler(gen))
+        logger.info(f"---Timeout started for {self.TIMEOUT_SECONDS}s (gen={gen})")
 
     
     async def delayed_hangup(self, delay: float):
@@ -283,79 +296,78 @@ Else:
             self._ctx.shutdown(reason="Appointment created successfully")        
 
     def cancel_timeout(self):
-        """Cancel the current timeout task"""
         if self._timeout_task and not self._timeout_task.done():
             self._timeout_task.cancel()
-            logger.info(f"---Timeout cancelled - previous num_timeouts: {self._num_timeouts}")
+        self._timeout_task = None
+        self._timeout_gen += 1       # invalidate any in-flight handler
         self._num_timeouts = 0
+        logger.info("---Timeout canceled; counters reset")
 
 
     async def timeout_handler(self):
-        """If second timeout in a row transfer call"""
-        logger.info(f"*****timeout_handler - num_timeouts= {self._num_timeouts}")       
-        self._num_timeouts = self._num_timeouts + 1 
-        if self._num_timeouts > 2:
-            logger.info(f"User timeout detected {self._num_timeouts} times in a row, transfer_to_number")
-            """Hard coded values for now"""
-            await self.transfer_to_number()
-            return
-
-        """Handle timeout when user doesn't respond"""
+        """Wait; if still idle, issue a state-aware reprompt or escalate."""
+        # 1) actually wait
         await asyncio.sleep(self.TIMEOUT_SECONDS)
 
-        """Send reprompt only 1 time"""
-        if self._num_timeouts == 1:
-            logger.info(f"User timeout after {self.TIMEOUT_SECONDS}s, triggering follow-up")       
+        # 2) was this timer canceled/restarted meanwhile?
+        if gen != self._timeout_gen:
+            return
 
-            if self._current_state == "get name":
-                reprompt = "Whenever you are ready, please tell me what is your first and last name?"
-                self._current_state = "get ymm"
-                await self._session_ref.say(
-                    reprompt
-                )            
-                return
-            """current_action get ymm should be implemented later"""
-            if self._current_state == "get ymm":
-                reprompt = f"Just checking in {self.customer_data['first_name']}. Are u still there, Can u please tell me your car's Year Make and Model?"
-                self._current_state = "get service"
-                await self._session_ref.say(
-                    reprompt
-                )     
-                return
-            if self._current_state == "get service":
-                reprompt = f"Are u still there {self.customer_data['first_name']}, would you like an oil change?"
-                self._current_state = "get transportation"
-                await self._session_ref.say(
-                    reprompt
-                )
-                return
-            """current_action get transportation should be implemented later"""
-            if self._current_state == "get transportation":
-                reprompt = f"Are u still there {self.customer_data['first_name']}, Can u please tell me if you desire to drop off your vehicle or wait at the dealership?"
-                self._current_state = "first availability"
-                await self._session_ref.say(
-                    reprompt
-                )
-                return
-            if self._current_state == "first availability":
-                reprompt = "Ask if user is still there. repeat availability"
-                self._current_state = "check availability"
-                await self._session_ref.generate_reply(
-                    instructions=reprompt
-                )
-                return
-            if self._current_state == "check availability":
-                reprompt = "Ask if user is still there. repeat availability"
-                self._current_state = "check availability"
-                await self._session_ref.generate_reply(
-                    instructions=reprompt
-                )
-                return
-            await session.generate_reply(
-                instructions="Repeat please"
-            )
+        # 3) count this *real* timeout
+        self._num_timeouts += 1
+        logger.info(f"timeout_handler: count={self._num_timeouts}, state={self._current_state}")
+
+        # 4) escalate on 3rd silence
+        if self._num_timeouts >= self.MAX_TIMEOUTS:
+            logger.info("Timeout escalation → transfer_to_number()")
+            await self._session_ref.say("Let me connect you to a person.")
+            await self.transfer_to_number("+16506905516")
+            return
+
+        # 5) state-aware reprompts (1st/2nd timeout)
+        first_name = (self.customer_data or {}).get("first_name") or "there"
             
-        
+        if self._current_state == "get name":
+            # 1st timeout
+            reprompt = "Whenever you are ready, please tell me your first and last name."
+            self._current_state = "get ymm"            # advance after reprompt
+            await self._session_ref.say(reprompt)
+
+        elif self._current_state == "get ymm":
+            reprompt = f"Just checking in {first_name}. Could you tell me your car’s year, make, and model?"
+            self._current_state = "get service"
+            await self._session_ref.say(reprompt)
+
+        elif self._current_state == "get service":
+            reprompt = f"Are you still there {first_name}? Would you like an oil change?"
+            self._current_state = "get transportation"
+            await self._session_ref.say(reprompt)
+
+        elif self._current_state == "get transportation":
+            reprompt = (f"Are you still there {first_name}? Would you like to drop off your vehicle "
+                        "or wait at the dealership?")
+            self._current_state = "first availability"
+            await self._session_ref.say(reprompt)
+
+        elif self._current_state == "first availability":
+            # For availability, you wanted LLM to “repeat availability”
+            reprompt = "Ask if user is still there. Repeat availability."
+            self._current_state = "check availability"
+            await self._session_ref.generate_reply(instructions=reprompt)
+
+        elif self._current_state == "check availability":
+            reprompt = "Ask if user is still there. Repeat availability."
+            # stay in "check availability"
+            await self._session_ref.generate_reply(instructions=reprompt)
+
+        else:
+            # generic fallback
+            await self._session_ref.generate_reply(instructions="Repeat please")
+
+        # 6) arm the next timeout window (for next escalation)
+        self.start_timeout()
+
+    
     def _generate_available_slots(self) -> Dict[str, List[str]]:
         """Generate available time slots for the next 2 weeks"""
         slots = {}
@@ -848,15 +860,18 @@ async def entrypoint(ctx: JobContext):
 
     @session.on("user_state_changed")
     def _on_user_state_changed(ev: UserStateChangedEvent):
-        if ev.new_state == "speaking":  
+        if ev.new_state == "speaking":
             agent.cancel_timeout()
             logger.info(f"User state changed: {ev.new_state} - Cancel Timeout")
         if ev.new_state == "away":  
             agent.start_timeout()
             logger.info(f"User state changed: {ev.new_state} - Restart Timeout")
 
-    # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
-    # when it's detected, you may resume the agent's speech
+    @session.on("transcript")
+    def _on_transcript(ev):
+        txt = getattr(ev, "text", "") or ""
+        if txt.strip():
+            agent.cancel_timeout()
 
     @session.on("agent_false_interruption")
     def _on_agent_false_interruption(ev: AgentFalseInterruptionEvent):
@@ -870,7 +885,7 @@ async def entrypoint(ctx: JobContext):
     def _on_metrics_collected(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
-        
+
         # Check if this is TTS metrics and appointment was created
         if agent.appointment_created and isinstance(ev.metrics, TTSMetrics):
             print("TTS metrics collected")
@@ -879,7 +894,7 @@ async def entrypoint(ctx: JobContext):
                 hangup_delay = audio_duration + 0.5  # Add 0.5s buffer
                 logger.info(f"TTS audio duration: {audio_duration}s, scheduling hangup in {hangup_delay}s")
                 asyncio.create_task(agent.delayed_hangup(hangup_delay))
-        
+
         # Restart timeout after each TTS response (agent finished speaking)
         if isinstance(ev.metrics, TTSMetrics):
             # Start timeout after audio duration finishes

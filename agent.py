@@ -1,8 +1,4 @@
 #I set preemptive_generation=False,
-#Added global session params _current_state / _call_already_transferred / _background_state to stop_background (when transfer to person) / _num_timeouts / timeout_task
-#Issue: timeout_handler, after 20s of silence, expected: transfer_to_number. found: no transfer log
-#Added transfer_to_number (not completed)
-#Added stop_background (when transfer to person)
 
 import logging
 import aiohttp
@@ -27,24 +23,22 @@ from livekit.agents import (
     metrics,
     get_job_context,
 )
-from livekit.agents.metrics import TTSMetrics
-
+from livekit import agents
+from livekit import rtc
 from livekit import api
-from livekit.protocol.sip import TransferSIPParticipantRequest
-from livekit.protocol import room as room_msgs  # ✅ protocol types live here
 from livekit.agents.llm import function_tool
+from livekit.agents.metrics import TTSMetrics
+from livekit.protocol import room as room_msgs  # ✅ protocol types live here
+from livekit.protocol.sip import TransferSIPParticipantRequest
 from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
 from livekit.plugins.elevenlabs import VoiceSettings
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
-from livekit import agents
-
-logger = logging.getLogger("agent")
-load_dotenv(".env")
-
 import asyncio
 import time
 import subprocess
-from livekit import rtc
+
+logger = logging.getLogger("agent")
+load_dotenv(".env")
 
 # Extract phone number from room name
 def extract_phone_from_room_name(room_name: str) -> str:
@@ -115,18 +109,17 @@ class AutomotiveBookingAssistant(Agent):
 - For recall, reschedule appointment or cancel appointment: trigger transfer_call tool
 - For speak with someone, customer service, or user is frustrated: trigger transfer_call tool
 
-- For address: "80 Queens Plate Dr, Etobicoke"
-- For price: "oil change starts at $130 plus tax"
-- For Wait time: "45 minutes to 1 hour"
-- If service is oil change, ask if user needs a cabin air filter replacement or a tire rotation
-- If maintenance, first service or general service: Set is_maintenance to 1
+- For address: 80 Queens Plate Dr, Etobicoke
+- For price: oil change starts at $130 plus tax
+- For Wait time: 45 minutes to 1 hour
+- If ask are you a human or real person: "I am actually a voice AI assistant to help you with your service appointment". Repeat last question
 
 ## Follow this conversation flow:
 
 Step 1. Gather First and Last Name
-- If customer name and car details found: Hello {first_name}! welcome back to Woodbine Toyota. I see you are calling to schedule an appointment. What service would you like for your {year} {model}?. Proceed to Step 3
-- If car details not found: Hello {first_name}! welcome back to Woodbine Toyota. I see you are calling to schedule an appointment. What is your car's year, make, and model?. Proceed to Step 2
-- If customer name not found: Hello! You reached Woodbine Toyota Service. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
+- If customer name and car details found: Hello {first_name}! welcome back to Woodbine Toyota. My name is Sara. I see you are calling to schedule an appointment. What service would you like for your {year} {model}?. Proceed to Step 3
+- If car details not found: Hello {first_name}! welcome back to Woodbine Toyota. My name is Sara. I see you are calling to schedule an appointment. What is your car's year, make, and model?. Proceed to Step 2
+- If customer name not found: Hello! You reached Woodbine Toyota Service. My name is Sara. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
 
 Step 2. Gather vehicle year make and model
 - If first name or last name not captured: What is the spelling of your first name / last name?
@@ -136,10 +129,14 @@ Step 2. Gather vehicle year make and model
 Step 3. Gather services
 - Ask what services are needed for the vehicle, for example oil change, diagnostics, repairs
 - Wait for services
-- Must go to Step 4 before Step 5
+  - If services has oil change, thank user and ask if user needs a cabin air filter replacement or a tire rotation
+  - If services has maintenance, first service or general service: 
+      thank user and ask if user is interested in adding wiper blades during the appointment
+      Set is_maintenance to 1
+- Confirm services
 
 Step 4. Gather transportation
-- After capture services, Ask if user will be dropping off the vehicle or waiting while we do the work
+- After capture services, Ask if will be dropping off the vehicle or waiting while we do the work
 - Wait for transportation
 - After services and transportation captured, call save_services_detail tool
 - Must go to Step 5 before Step 6
@@ -151,7 +148,7 @@ Step 5. Gather mileage
 - After transportation captured, call check_available_slots tool
 
 Step 6. Offer first availability
-- After services, transportation captured: offer the first availability and ask if that will work, or if the user has a specific time
+- After services, transportation captured: Thank user, offer the first availability and ask if that will work, or if the user has a specific time
 
 Step 7. Find availability
 If first availability works for user, book it
@@ -163,7 +160,7 @@ Else:
         Offer 3 available times and repeat till user finds availability.
             If availability is found, confirm with: Just to be sure, you would like to book ...
     On book:
-        Inform the user they will receive an email or text confirmation shortly. Have a great day and we will see you soon
+        Thank the user and Inform they will receive an email or text confirmation shortly. Have a great day and we will see you soon
         Trigger tool name create_appointment.
         After triggering create_appointment, say goodbye and the call will automatically end.""",
     )

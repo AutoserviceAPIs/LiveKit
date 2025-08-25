@@ -301,7 +301,7 @@ Else:
         logger.info("---Timeout canceled; counters reset")
 
 
-    async def timeout_handler(self):
+    async def timeout_handler(self, gen):
         """Wait; if still idle, issue a state-aware reprompt or escalate."""
         # 1) actually wait
         await asyncio.sleep(self.TIMEOUT_SECONDS)

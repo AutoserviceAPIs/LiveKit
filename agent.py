@@ -837,12 +837,13 @@ async def entrypoint(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all providers at https://docs.livekit.io/agents/integrations/tts/
         tts=elevenlabs.TTS(
-            voice_id="xcK84VTjd6MHGJo2JVfS",
+            voice_id="zmcVlqmyk3Jpn5AVYcAL", #sapphire
+            #voice_id="xcK84VTjd6MHGJo2JVfS",#cloned
             model="eleven_flash_v2_5",
             api_key="59bb59df13287e23ba2da37ea6e48724",
             voice_settings= VoiceSettings(
                 similarity_boost=0.4,
-                speed=0.94,
+                speed=1,
                 stability=0.3,
                 style=1,
                 use_speaker_boost=True

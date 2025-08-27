@@ -1,8 +1,4 @@
 #I set preemptive_generation=False,
-#Added global session params _current_state / _call_already_transferred / _background_state to stop_background (when transfer to person) / _num_timeouts / timeout_task
-#Issue: timeout_handler, after 20s of silence, expected: transfer_to_number. found: no transfer log
-#Added transfer_to_number (not completed)
-#Added stop_background (when transfer to person)
 
 import logging
 import aiohttp
@@ -27,11 +23,13 @@ from livekit.agents import (
     metrics,
     get_job_context,
 )
-from livekit.agents.metrics import TTSMetrics
-
+from livekit import agents
+from livekit import rtc
 from livekit import api
-from livekit.protocol.sip import TransferSIPParticipantRequest
 from livekit.agents.llm import function_tool
+from livekit.agents.metrics import TTSMetrics
+from livekit.protocol import room as room_msgs  # ✅ protocol types live here
+from livekit.protocol.sip import TransferSIPParticipantRequest
 from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
 from livekit.plugins.elevenlabs import VoiceSettings
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -40,8 +38,11 @@ logger = logging.getLogger("agent")
 import os
 load_dotenv(".env")
 import asyncio
+import time
 import subprocess
-from livekit import rtc
+
+logger = logging.getLogger("agent")
+load_dotenv(".env")
 
 # Extract phone number from room name
 def extract_phone_from_room_name(room_name: str) -> str:
@@ -53,19 +54,49 @@ def extract_phone_from_room_name(room_name: str) -> str:
 
 # Add hangup_call function according to LiveKit documentation
 async def hangup_call():
+    """
+    Disconnect the PSTN/SIP caller. Prefer removing the SIP participant;
+    fall back to deleting the room (which disconnects everyone).
+    """
     ctx = get_job_context()
-    if ctx is None:
-        # Not running in a job context
+    if not ctx:
+        logger.warning("hangup_call(): no job context")
         return
-    
-    await ctx.api.room.delete_room(
-        api.DeleteRoomRequest(
-            room=ctx.room.name,
-        )
-    )
 
+    lk = ctx.api            # LiveKitAPI client provided by the job
+    room = ctx.room
+
+    # Log participants to make sure we target the SIP leg
+    for p in room.remote_participants.values():
+        logger.info("Remote participant: %s attrs=%s", p.identity, getattr(p, "attributes", {}))
+
+    removed_any = False
+    for p in list(room.remote_participants.values()):
+        attrs = getattr(p, "attributes", {}) or {}
+        if any(k.startswith("sip.") for k in attrs.keys()):
+            try:
+                await lk.room.remove_participant(
+                    room_msgs.RoomParticipantIdentity(room=room.name, identity=p.identity)  # ✅ correct type
+                )
+                logger.info("Removed SIP participant: %s", p.identity)
+                removed_any = True
+            except Exception as e:
+                logger.warning("remove_participant failed for %s: %s", p.identity, e)
+
+    if not removed_any:
+        try:
+            await lk.room.delete_room(  # ✅ this disconnects all participants
+                room_msgs.DeleteRoomRequest(room=room.name)
+            )
+            logger.info("Room deleted via delete_room()")
+        except Exception as e:
+            logger.warning("delete_room failed: %s", e)
+            
 
 class AutomotiveBookingAssistant(Agent):
+    TIMEOUT_SECONDS = 10
+    MAX_TIMEOUTS    = 3         # on the 3rd timeout -> transfer
+
     def __init__(self, session, ctx) -> None:
         super().__init__(
            instructions="""You are a receptionist for Woodbine Toyota. Help customers book appointments.
@@ -73,7 +104,7 @@ class AutomotiveBookingAssistant(Agent):
 ## CUSTOMER LOOKUP:
 - At the beginning of the conversation, call lookup_customer function first (We already have customer phone number).
 - lookup_customer returns customer name, car details, or booking details.
-- trigger transfer_to_number tool
+
 ## RULES:
 - After collecting car year make and model: trigger save_customer_information tool
 - After collecting services and transportation: trigger save_services_detail tool
@@ -82,18 +113,17 @@ class AutomotiveBookingAssistant(Agent):
 - For recall, reschedule appointment or cancel appointment: trigger transfer_call tool
 - For speak with someone, customer service, or user is frustrated: trigger transfer_call tool
 
-- For address: "80 Queens Plate Dr, Etobicoke"
-- For price: "oil change starts at $130 plus tax"
-- For Wait time: "45 minutes to 1 hour"
-- If service is oil change, ask if user needs a cabin air filter replacement or a tire rotation
-- If maintenance, first service or general service: Set is_maintenance to 1
+- For address: 80 Queens Plate Dr, Etobicoke
+- For price: oil change starts at $130 plus tax
+- For Wait time: 45 minutes to 1 hour
+- If ask are you a human or real person: "I am actually a voice AI assistant to help you with your service appointment". Repeat last question
 
 ## Follow this conversation flow:
 
 Step 1. Gather First and Last Name
-- If customer name and car details found: Hello {first_name}! welcome back to Woodbine Toyota. I see you are calling to schedule an appointment. What service would you like for your {year} {model}?. Proceed to Step 3
-- If car details not found: Hello {first_name}! welcome back to Woodbine Toyota. I see you are calling to schedule an appointment. What is your car's year, make, and model?. Proceed to Step 2
-- If customer name not found: Hello! You reached Woodbine Toyota Service. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
+- If customer name and car details found: Hello {first_name}! welcome back to Woodbine Toyota. My name is Sara. I see you are calling to schedule an appointment. What service would you like for your {year} {model}?. Proceed to Step 3
+- If car details not found: Hello {first_name}! welcome back to Woodbine Toyota. My name is Sara. I see you are calling to schedule an appointment. What is your car's year, make, and model?. Proceed to Step 2
+- If customer name not found: Hello! You reached Woodbine Toyota Service. My name is Sara. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
 
 Step 2. Gather vehicle year make and model
 - If first name or last name not captured: What is the spelling of your first name / last name?
@@ -103,10 +133,14 @@ Step 2. Gather vehicle year make and model
 Step 3. Gather services
 - Ask what services are needed for the vehicle, for example oil change, diagnostics, repairs
 - Wait for services
-- Must go to Step 4 before Step 5
+  - If services has oil change, thank user and ask if user needs a cabin air filter replacement or a tire rotation
+  - If services has maintenance, first service or general service: 
+      thank user and ask if user is interested in adding wiper blades during the appointment
+      Set is_maintenance to 1
+- Confirm services
 
 Step 4. Gather transportation
-- After capture services, Ask if user will be dropping off the vehicle or waiting while we do the work
+- After capture services, Ask if will be dropping off the vehicle or waiting while we do the work
 - Wait for transportation
 - After services and transportation captured, call save_services_detail tool
 - Must go to Step 5 before Step 6
@@ -118,7 +152,7 @@ Step 5. Gather mileage
 - After transportation captured, call check_available_slots tool
 
 Step 6. Offer first availability
-- After services, transportation captured: offer the first availability and ask if that will work, or if the user has a specific time
+- After services, transportation captured: Thank user, offer the first availability and ask if that will work, or if the user has a specific time
 
 Step 7. Find availability
 If first availability works for user, book it
@@ -130,20 +164,22 @@ Else:
         Offer 3 available times and repeat till user finds availability.
             If availability is found, confirm with: Just to be sure, you would like to book ...
     On book:
-        Inform the user they will receive an email or text confirmation shortly. Have a great day and we will see you soon
+        Thank the user and Inform they will receive an email or text confirmation shortly. Have a great day and we will see you soon
         Trigger tool name create_appointment.
         After triggering create_appointment, say goodbye and the call will automatically end.""",
     )
 
         # Globals
         # Add timeout handler for user silence
-        self.TIMEOUT_SECONDS           = 8  # Configurable timeout
         self._session_ref              = session      # keep session for say(), generate_reply(), etc
         self._ctx                      = ctx          # keep context for shutdown, logging, etc
-        self._current_state            = "get name"   # initialize conversation state
+        self._current_state            = getattr(self, "_current_state", None) or "get name"
         self._call_already_transferred = False        #Prevents multiple transfers
-        self._num_timeouts             = 0            # Num of back-to-back timesouts 
+        self._num_timeouts             = 0            # Num of back-to-back timesouts
         self._timeout_task             = None
+        self._timeout_gen              = 0            # increases every (re)start/cancel
+        self._num_timeouts             = 0
+        self._loop                     = None         # set on first async call
         self._sip_participant_identity = None         # Store SIP participant identity for transfer
         # Keep references so we can stop later
         self._background_state = {
@@ -221,110 +257,118 @@ Else:
         logger.info(f"set_current_state - current_action: {status}")
 
     
+    async def _ensure_loop(self):
+        if not self._loop or not self._loop.is_running():
+            self._loop = asyncio.get_running_loop()
+
+
+    async def _get_lk(self) -> api.LiveKitAPI:
+        if self._lk is None:
+            # Reads LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET from env
+            self._lk = api.LiveKitAPI(session=http_session())
+        return self._lk
+
+    
     async def delayed_timeout_start(self, audio_duration):
         """Start timeout after audio finishes playing"""
         await asyncio.sleep(audio_duration + 0.5)
         self.start_timeout()   # ✅ use self.start_timeout()
         logger.info(f"Timeout started after {audio_duration}s audio finished")
 
+    
     def start_timeout(self):
         """Start a new timeout task"""
         if self._timeout_task and not self._timeout_task.done():
             self._timeout_task.cancel()
-        self._timeout_task = asyncio.create_task(self.timeout_handler())
-        logger.info(f"---Timeout started for: {self.TIMEOUT_SECONDS}s")
+        self._timeout_gen += 1 
+        gen = self._timeout_gen
+        self._timeout_task = asyncio.create_task(self.timeout_handler(gen))
+        logger.info(f"---Timeout started for {self.TIMEOUT_SECONDS}s (gen={gen})")
+
     
-    async def delayed_hangup(ctx, delay):
-        """Hangup after calculated delay based on audio duration"""
-        await asyncio.sleep(delay)
+    async def delayed_hangup(self, delay: float):
+        await asyncio.sleep(max(0.0, delay))
         logger.info("Hanging up call after appointment creation")
-        
-        # Use LiveKit's proper hangup method to end call for all participants
         try:
             await hangup_call()
-            logger.info("SIP call hung up successfully - all participants disconnected")
-        except Exception as e:
-            logger.error(f"Error hanging up SIP call: {e}")
-        
-        # Then shutdown the agent
-        logger.info("Shutting down agent")
-        ctx.shutdown(reason="Appointment created successfully")
-
+            logger.info("SIP call hung up (participant removed / room deleted)")
+        finally:
+            logger.info("Shutting down agent")
+            self._ctx.shutdown(reason="Appointment created successfully")        
 
     def cancel_timeout(self):
-        """Cancel the current timeout task"""
         if self._timeout_task and not self._timeout_task.done():
             self._timeout_task.cancel()
-            logger.info(f"---Timeout cancelled - previous num_timeouts: {self._num_timeouts}")
+        self._timeout_task = None
+        self._timeout_gen += 1       # invalidate any in-flight handler
         self._num_timeouts = 0
+        logger.info("---Timeout canceled; counters reset")
 
 
-    async def timeout_handler(self):
-        """If second timeout in a row transfer call"""
-        logger.info(f"*****timeout_handler - num_timeouts= {self._num_timeouts}")       
-        if self._num_timeouts > 0:
-            logger.info(f"User timeout detected {self._num_timeouts} times in a row, transfer_to_number")
-            """Hard coded values for now"""
-            await self.transfer_to_number()
-            return
-
-        """Handle timeout when user doesn't respond"""
+    async def timeout_handler(self, gen):
+        """Wait; if still idle, issue a state-aware reprompt or escalate."""
+        # 1) actually wait
         await asyncio.sleep(self.TIMEOUT_SECONDS)
 
-        """Send reprompt only 1 time"""
-        if self._num_timeouts == 0:
-            logger.info(f"User timeout after {self.TIMEOUT_SECONDS}s, triggering follow-up")       
-            self._num_timeouts = self._num_timeouts + 1 
+        # 2) was this timer canceled/restarted meanwhile?
+        if gen != self._timeout_gen:
+            return
 
-            if self._current_state == "get name":
-                reprompt = "Whenever you are ready, please tell me what is your first and last name?"
-                self._current_state = "get ymm"
-                await self._session_ref.say(
-                    reprompt
-                )            
-                return
-            """current_action get ymm should be implemented later"""
-            if self._current_state == "get ymm":
-                reprompt = f"Just checking in {self.customer_data['first_name']}. Are u still there, Can u please tell me your car's Year Make and Model?"
-                self._current_state = "get service"
-                await self._session_ref.say(
-                    reprompt
-                )     
-                return
-            if self._current_state == "get service":
-                reprompt = f"Are u still there {self.customer_data['first_name']}, would you like an oil change?"
-                self._current_state = "get transportation"
-                await self._session_ref.say(
-                    reprompt
-                )
-                return
-            """current_action get transportation should be implemented later"""
-            if self._current_state == "get transportation":
-                reprompt = f"Are u still there {self.customer_data['first_name']}, Can u please tell me if you desire to drop off your vehicle or wait at the dealership?"
-                self._current_state = "first availability"
-                await self._session_ref.say(
-                    reprompt
-                )
-                return
-            if self._current_state == "first availability":
-                reprompt = "Ask if user is still there. repeat availability"
-                self._current_state = "check availability"
-                await self._session_ref.generate_reply(
-                    instructions=reprompt
-                )
-                return
-            if self._current_state == "check availability":
-                reprompt = "Ask if user is still there. repeat availability"
-                self._current_state = "check availability"
-                await self._session_ref.generate_reply(
-                    instructions=reprompt
-                )
-                return
-            await session.generate_reply(
-                instructions="Repeat please"
-            )
+        # 3) count this *real* timeout
+        self._num_timeouts += 1
+        logger.info(f"timeout_handler: count={self._num_timeouts}, state={self._current_state}")
+
+        # 4) escalate on 3rd silence
+        if self._num_timeouts >= self.MAX_TIMEOUTS:
+            logger.info("Timeout escalation → transfer_to_number()")
+            await self._session_ref.say("Let me connect you to a person.")
+            await self.transfer_to_number("+16506905516")
+            return
+
+        # 5) state-aware reprompts (1st/2nd timeout)
+        first_name = (self.customer_data or {}).get("first_name") or "there"
             
-        
+        if self._current_state == "get name":
+            # 1st timeout
+            reprompt = "Whenever you are ready, please tell me your first and last name."
+            self._current_state = "get ymm"            # advance after reprompt
+            await self._session_ref.say(reprompt)
+
+        elif self._current_state == "get ymm":
+            reprompt = f"Just checking in {first_name}. Could you tell me your car’s year, make, and model?"
+            self._current_state = "get service"
+            await self._session_ref.say(reprompt)
+
+        elif self._current_state == "get service":
+            reprompt = f"Are you still there {first_name}? Would you like an oil change?"
+            self._current_state = "get transportation"
+            await self._session_ref.say(reprompt)
+
+        elif self._current_state == "get transportation":
+            reprompt = (f"Are you still there {first_name}? Would you like to drop off your vehicle "
+                        "or wait at the dealership?")
+            self._current_state = "first availability"
+            await self._session_ref.say(reprompt)
+
+        elif self._current_state == "first availability":
+            # For availability, you wanted LLM to “repeat availability”
+            reprompt = "Ask if user is still there. Repeat availability."
+            self._current_state = "check availability"
+            await self._session_ref.generate_reply(instructions=reprompt)
+
+        elif self._current_state == "check availability":
+            reprompt = "Ask if user is still there. Repeat availability."
+            # stay in "check availability"
+            await self._session_ref.generate_reply(instructions=reprompt)
+
+        else:
+            # generic fallback
+            await self._session_ref.generate_reply(instructions="Repeat please")
+
+        # 6) arm the next timeout window (for next escalation)
+        self.start_timeout()
+
+    
     def _generate_available_slots(self) -> Dict[str, List[str]]:
         """Generate available time slots for the next 2 weeks"""
         slots = {}
@@ -819,12 +863,13 @@ async def entrypoint(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all providers at https://docs.livekit.io/agents/integrations/tts/
         tts=elevenlabs.TTS(
-            voice_id="xcK84VTjd6MHGJo2JVfS",
+            voice_id="zmcVlqmyk3Jpn5AVYcAL", #sapphire
+            #voice_id="xcK84VTjd6MHGJo2JVfS",#cloned
             model="eleven_flash_v2_5",
             api_key="59bb59df13287e23ba2da37ea6e48724",
             voice_settings= VoiceSettings(
                 similarity_boost=0.4,
-                speed=0.94,
+                speed=1,
                 stability=0.3,
                 style=1,
                 use_speaker_boost=True
@@ -839,7 +884,7 @@ async def entrypoint(ctx: JobContext):
 
     @session.on("user_state_changed")
     def _on_user_state_changed(ev: UserStateChangedEvent):
-        if ev.new_state == "speaking":  
+        if ev.new_state == "speaking":
             agent.cancel_timeout()
             logger.info(f"User state changed: {ev.new_state} - Cancel Timeout")
         if ev.new_state == "away":  
@@ -858,6 +903,11 @@ async def entrypoint(ctx: JobContext):
 
     # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
     # when it's detected, you may resume the agent's speech
+    @session.on("transcript")
+    def _on_transcript(ev):
+        txt = getattr(ev, "text", "") or ""
+        if txt.strip():
+            agent.cancel_timeout()
 
     @session.on("agent_false_interruption")
     def _on_agent_false_interruption(ev: AgentFalseInterruptionEvent):
@@ -871,7 +921,7 @@ async def entrypoint(ctx: JobContext):
     def _on_metrics_collected(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
-        
+
         # Check if this is TTS metrics and appointment was created
         if agent.appointment_created and isinstance(ev.metrics, TTSMetrics):
             print("TTS metrics collected")
@@ -879,8 +929,8 @@ async def entrypoint(ctx: JobContext):
             if audio_duration > 0:
                 hangup_delay = audio_duration + 0.5  # Add 0.5s buffer
                 logger.info(f"TTS audio duration: {audio_duration}s, scheduling hangup in {hangup_delay}s")
-                asyncio.create_task(agent.delayed_hangup(ctx, hangup_delay))
-        
+                asyncio.create_task(agent.delayed_hangup(hangup_delay))
+
         # Restart timeout after each TTS response (agent finished speaking)
         if isinstance(ev.metrics, TTSMetrics):
             # Start timeout after audio duration finishes

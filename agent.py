@@ -37,7 +37,7 @@ from livekit.plugins.elevenlabs import VoiceSettings
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit import agents
 logger = logging.getLogger("agent")
-
+import os
 load_dotenv(".env")
 import asyncio
 import subprocess
@@ -453,18 +453,6 @@ Else:
         if self._call_already_transferred:
             logger.info("Call already transferred, skipping")
             return
-            
-        # transfer_to = "+16616811200"  # Hard coded transfer number
-        
-        # Stop background music before transfer
-        # await self.stop_background(self._ctx.room)
-        
-        # Let the agent finish speaking before transfer
-        # current_speech = self._session_ref.current_speech
-        # if current_speech:
-        #     await current_speech.wait_for_playout()
-        
-        # Inform user about transfer
         
         try:
             # Use stored SIP participant identity
@@ -473,11 +461,22 @@ Else:
                 return
             
             logger.info(f"Transferring participant: {self._sip_participant_identity}")
-            async with api.LiveKitAPI() as livekit_api:
-                transfer_to = 'tel:+16506900634'
+            livekit_url = os.getenv('LIVEKIT_URL')
+            api_key = os.getenv('LIVEKIT_API_KEY')
+            api_secret = os.getenv('LIVEKIT_API_SECRET')
+            print("----------------")
+            print(livekit_url)
+            print(api_key)
+            print(api_secret)
+
+            async with api.LiveKitAPI(
+                url=livekit_url,
+                api_key=api_key,
+                api_secret=api_secret
+            ) as livekit_api:
+                transfer_to = '<sip:16616811200@x.autoserviceai.voximplant.com;user=phone>'
                 job_ctx = get_job_context()
                 room_name = job_ctx.room.name
-
                 # Create transfer request
                 transfer_request = TransferSIPParticipantRequest(
                     participant_identity=self._sip_participant_identity,
@@ -489,18 +488,7 @@ Else:
 
                 # Transfer caller
                 await livekit_api.sip.transfer_sip_participant(transfer_request)
-            # # Transfer the call using LiveKit API
-            # job_ctx = get_job_context()
-            # await job_ctx.api.sip.transfer_sip_participant(
-            #         api.TransferSIPParticipantRequest(
-            #             room_name=job_ctx.room.name,
-            #             participant_identity=self._sip_participant_identity,
-            #             # to use a sip destination, use `sip:user@host` format
-            #             play_dialtone=True,
-            #             transfer_to=f"tel:{transfer_to}",
-            #         )
-            #     )
-            
+
                 logger.info(f"Call transferred successfully to {transfer_to}")
                 self._call_already_transferred = True
                 
@@ -782,10 +770,44 @@ def prewarm(proc: JobProcess):
 
 
 async def entrypoint(ctx: JobContext):
+    # Create timestamp once to use for both recording and transcript
+    recording_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
     # Logging setup
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
+
+    # Set up recording for audio
+    try:
+        req = api.RoomCompositeEgressRequest(
+            room_name=ctx.room.name,
+            audio_only=True,
+            file_outputs=[api.EncodedFileOutput(
+                file_type=api.EncodedFileType.OGG,
+                filepath=f"./{ctx.room.name}_{recording_timestamp}.ogg",
+                s3=api.S3Upload(
+                    bucket=os.getenv('S3_BUCKET_NAME', 'recording-autoservice'),
+                    region=os.getenv('S3_REGION', 'us-east-1'),
+                    access_key=os.getenv('S3_ACCESS_KEY'),
+                    secret=os.getenv('S3_SECRET_KEY'),
+                ),
+            )],
+        )
+
+        livekit_url = os.getenv('LIVEKIT_URL')
+        api_key = os.getenv('LIVEKIT_API_KEY')
+        api_secret = os.getenv('LIVEKIT_API_SECRET')
+
+        async with api.LiveKitAPI(
+            url=livekit_url,
+            api_key=api_key,
+            api_secret=api_secret
+        ) as lkapi:
+            res = await lkapi.egress.start_room_composite_egress(req)
+            logger.info(f"Recording started with egress ID: {res.egress_id}")
+    except Exception as e:
+        logger.error(f"Failed to start recording: {e}")
 
     # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
     session = AgentSession(
@@ -824,6 +846,16 @@ async def entrypoint(ctx: JobContext):
             agent.start_timeout()
             logger.info(f"User state changed: {ev.new_state} - Restart Timeout")
 
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev):
+        """Log when conversation items are added"""
+        logger.info(f"Conversation item added: {ev.item.type} - {ev.item.content[0]}...")
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(ev):
+        """Log when user input is transcribed"""
+        logger.info(f"User input transcribed: {ev.transcript}")
+
     # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
     # when it's detected, you may resume the agent's speech
 
@@ -860,12 +892,104 @@ async def entrypoint(ctx: JobContext):
         summary = usage_collector.get_summary()
         logger.info(f"Usage: {summary}")
 
+    async def write_transcript():
+        """Save conversation history to JSON file and send to API"""
+        try:
+            # Use the same timestamp as recording
+            current_date = agent._recording_timestamp if hasattr(agent, '_recording_timestamp') else datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"./transcript_{ctx.room.name}_{current_date}.json"
+            
+            # Extract phone number from room name
+            phone_number = extract_phone_from_room_name(ctx.room.name)
+            formatted_phone = f"1{phone_number}" if phone_number else ""
+            
+            # Extract conversations from session history
+            conversations = ["TELEPHONY_WELCOME"]
+            if hasattr(session, 'history') and session.history:
+                history_dict = session.history.to_dict()
+                if 'items' in history_dict:
+                    for item in history_dict['items']:
+                        if 'content' in item and item['content']:
+                            # Get the first content element (usually the text)
+                            content = item['content'][0] if isinstance(item['content'], list) else str(item['content'])
+                            conversations.append(content)
+            
+            # Create record URL
+            record_filename = f"{ctx.room.name}_{current_date}.ogg"
+            record_url = f"https://recording-autoservice.s3.us-east-1.amazonaws.com/{record_filename}"
+            
+            # Create payload for API
+            payload = {
+                "phone": formatted_phone,
+                "agentId": 1,
+                "conversations": conversations,
+                "recordURL": record_url,
+                "transfer": agent._call_already_transferred,
+                "voicemail": False,  # You can modify this based on your logic
+                "booked": agent.appointment_created,
+                "bookingintent": True,  # You can modify this based on your logic
+                "perfect": True,  # You can modify this based on your logic
+                "businessName": "Woodbine Toyota",
+                "customerName": f"{agent.customer_data.get('first_name', '')} {agent.customer_data.get('last_name', '')}".strip(),
+                "serviceOriginal": ", ".join(agent.customer_data.get('services', [])),
+                "carModel": agent.customer_data.get('car_model', ''),
+                "carYear": agent.customer_data.get('car_year', ''),
+                "carMake": agent.customer_data.get('car_make', ''),
+                "advisorNumber": "",
+                "havetimeslots": len(agent.available_slots) > 0,
+                "project_id": "woodbine_toyota",
+                "check_url": "",
+                "book_url": "",
+                "transportation_drop": agent.customer_data.get('transportation', ''),
+                "fallback_service_default": "",
+                "hoursLocation": "80 Queens Plate Dr, Etobicoke"
+            }
+            
+            # Save local transcript file
+            conversation_data = {
+                "room_name": ctx.room.name,
+                "timestamp": datetime.now().isoformat(),
+                "conversation_history": session.history.to_dict(),
+                "customer_data": agent.customer_data,
+                "appointment_created": agent.appointment_created,
+                "call_transferred": agent._call_already_transferred,
+                "api_payload": payload
+            }
+            
+            with open(filename, 'w') as f:
+                json.dump(conversation_data, f, indent=2)
+            
+            logger.info(f"Transcript for {ctx.room.name} saved to {filename}")
+            
+            # Send to API
+            try:
+                async with aiohttp.ClientSession() as session_http:
+                    async with session_http.post(
+                        "https://voxbackend1-cx37agkkhq-uc.a.run.app/add-history",
+                        json=payload,
+                        headers={"Content-Type": "application/json"}
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            logger.info(f"History sent to API successfully: {result}")
+                        else:
+                            logger.error(f"Failed to send history to API: {response.status}")
+                            logger.error(f"Response: {await response.text()}")
+            except Exception as api_error:
+                logger.error(f"Error sending to API: {api_error}")
+                    
+        except Exception as e:
+            logger.error(f"Failed to write transcript: {e}")
+
     ctx.add_shutdown_callback(log_usage)
+    ctx.add_shutdown_callback(write_transcript)
 
     # Create agent instance
     agent = AutomotiveBookingAssistant(session, ctx)
     # Store context reference for shutdown
     agent._ctx = ctx
+    # Store recording timestamp for transcript
+    agent._recording_timestamp = recording_timestamp
 
     # Try to find customer by phone number if available
     phone_number = extract_phone_from_room_name(ctx.room.name)
@@ -902,5 +1026,5 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
-    # agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="my-telephony-agent"))
+    # cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="my-telephony-agent"))

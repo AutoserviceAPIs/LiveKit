@@ -1,3 +1,5 @@
+#Fixed timeout: transfer call on silence
+#Moved transfer_to to self._transfer_to
 #I set preemptive_generation=False,
 
 import logging
@@ -171,6 +173,7 @@ Else:
 
         # Globals
         # Add timeout handler for user silence
+        self._transfer_to              = '<sip:15129007000@x.autoserviceai.voximplant.com;user=phone>'        
         self._session_ref              = session      # keep session for say(), generate_reply(), etc
         self._ctx                      = ctx          # keep context for shutdown, logging, etc
         self._current_state            = getattr(self, "_current_state", None) or "get name"
@@ -319,10 +322,14 @@ Else:
         logger.info(f"timeout_handler: count={self._num_timeouts}, state={self._current_state}")
 
         # 4) escalate on 3rd silence
+        if self._num_timeouts == (self.MAX_TIMEOUTS - 1):
+            logger.info("Timeout skip cycle")
+            return     
+            
         if self._num_timeouts >= self.MAX_TIMEOUTS:
             logger.info("Timeout escalation → transfer_to_number()")
             await self._session_ref.say("Let me connect you to a person.")
-            await self.transfer_to_number("+16506905516")
+            await self.transfer_to_number()
             return
 
         # 5) state-aware reprompts (1st/2nd timeout)
@@ -518,7 +525,7 @@ Else:
                 api_key=api_key,
                 api_secret=api_secret
             ) as livekit_api:
-                transfer_to = '<sip:16616811200@x.autoserviceai.voximplant.com;user=phone>'
+                transfer_to = self._transfer_to
                 job_ctx = get_job_context()
                 room_name = job_ctx.room.name
                 # Create transfer request

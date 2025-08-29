@@ -16,21 +16,9 @@ import json
 
 from dotenv import load_dotenv
 from livekit.agents import (
-    NOT_GIVEN,
-    Agent,
-    UserStateChangedEvent,
-    AgentFalseInterruptionEvent,
-    AgentSession,
-    JobContext,
-    JobProcess,
-    MetricsCollectedEvent,
-    RoomInputOptions,
-    RunContext,
-    WorkerOptions,
-    cli,
-    metrics,
-    get_job_context,
-)
+    NOT_GIVEN, Agent, UserStateChangedEvent, AgentFalseInterruptionEvent,
+    AgentSession, JobContext, JobProcess, MetricsCollectedEvent,
+    RoomInputOptions, RunContext, WorkerOptions, cli, metrics, get_job_context,)
 from livekit import agents
 from livekit import rtc
 from livekit import api
@@ -48,6 +36,7 @@ load_dotenv(".env")
 import asyncio
 import time
 import subprocess
+import re
 
 logger = logging.getLogger("agent")
 load_dotenv(".env")
@@ -55,7 +44,6 @@ load_dotenv(".env")
 # Extract phone number from room name
 def extract_phone_from_room_name(room_name: str) -> str:
     """Extract phone number from room name format: call-_8055057710_uHsvtynDWWJN"""
-    import re
     pattern = r'call-_(\d+)_'
     match = re.search(pattern, room_name)
     return match.group(1) if match else ""
@@ -149,7 +137,6 @@ Else:
         self._num_timeouts             = 0            # Num of back-to-back timesouts
         self._timeout_task             = None
         self._timeout_gen              = 0            # increases every (re)start/cancel
-        self._num_timeouts             = 0
         self._loop                     = None         # set on first async call
         self._sip_participant_identity = None         # Store SIP participant identity for transfer
         # Keep references so we can stop later
@@ -212,6 +199,23 @@ Else:
             "WAITER": "11111111-1111-1111-1111-111111111111"
         }
         
+        self.voice_by_lang = {
+            "en-US": "zmcVlqmyk3Jpn5AVYcAL",
+            "es":    "jB2lPb5DhAX6l1TLkKXy",
+            "fr":    "BewlJwjEWiFLWoXrbGMf",
+            "hi":    "CpLFIATEbkaZdJr01erZ",
+
+            # Vietnamese (standard + regional alias)
+            "vi":    "8h6XlERYN1nW5v3TWkOQ",
+            "vi-VN": "8h6XlERYN1nW5v3TWkOQ",
+
+            # Chinese (standard + mainland alias). Avoid 'cn' (non-standard), but keep it as a fallback if you like.
+            "zh":    "bhJUNIXWQQ94l8eI2VUf",
+            "zh-CN": "bhJUNIXWQQ94l8eI2VUf",
+            # Optional backward-compat alias:
+            "cn":    "bhJUNIXWQQ94l8eI2VUf",
+        }
+
         # Generate available time slots for next 2 weeks
         self.available_slots = self._generate_available_slots()
         
@@ -559,7 +563,6 @@ Else:
             await self._session_ref.generate_reply(
                 instructions="Inform the user that the transfer failed and offer to continue helping them."
             )
-
 
 
     @function_tool
@@ -1092,5 +1095,5 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    # cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="my-telephony-agent"))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+    #agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="my-telephony-agent"))

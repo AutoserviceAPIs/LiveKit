@@ -1,8 +1,12 @@
+#TODO:
+#VAD: reduce sensitivity / languages
+#Languages
+
+#Fixed hangup
+#User does not know service / are you real?
+#Fixed timeout: transfer call on silence
+#Moved transfer_to to self._transfer_to
 #I set preemptive_generation=False,
-#Added global session params _current_state / _call_already_transferred / _background_state to stop_background (when transfer to person) / _num_timeouts / timeout_task
-#Issue: timeout_handler, after 20s of silence, expected: transfer_to_number. found: no transfer log
-#Added transfer_to_number (not completed)
-#Added stop_background (when transfer to person)
 
 import logging
 import aiohttp
@@ -12,87 +16,37 @@ import json
 
 from dotenv import load_dotenv
 from livekit.agents import (
-    NOT_GIVEN,
-    Agent,
-    UserStateChangedEvent,
-    AgentFalseInterruptionEvent,
-    AgentSession,
-    JobContext,
-    JobProcess,
-    MetricsCollectedEvent,
-    RoomInputOptions,
-    RunContext,
-    WorkerOptions,
-    cli,
-    metrics,
-    get_job_context,
-)
-from livekit.agents.metrics import TTSMetrics
-
+    NOT_GIVEN, Agent, UserStateChangedEvent, AgentFalseInterruptionEvent,
+    AgentSession, JobContext, JobProcess, MetricsCollectedEvent,
+    RoomInputOptions, RunContext, WorkerOptions, cli, metrics, get_job_context,)
+from livekit import agents
+from livekit import rtc
 from livekit import api
-from livekit.protocol.sip import TransferSIPParticipantRequest
-from livekit.protocol import room as room_msgs  # ✅ protocol types live here
 from livekit.agents.llm import function_tool
+from livekit.agents.metrics import TTSMetrics
+from livekit.protocol import room as room_msgs  # ✅ protocol types live here
+from livekit.protocol.sip import TransferSIPParticipantRequest
 from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
 from livekit.plugins.elevenlabs import VoiceSettings
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit import agents
+logger = logging.getLogger("agent")
+import os
+load_dotenv(".env")
+import asyncio
+import time
+import subprocess
+import re
 
 logger = logging.getLogger("agent")
 load_dotenv(".env")
 
-import asyncio
-import time
-import subprocess
-from livekit import rtc
-
 # Extract phone number from room name
 def extract_phone_from_room_name(room_name: str) -> str:
     """Extract phone number from room name format: call-_8055057710_uHsvtynDWWJN"""
-    import re
     pattern = r'call-_(\d+)_'
     match = re.search(pattern, room_name)
     return match.group(1) if match else ""
-
-# Add hangup_call function according to LiveKit documentation
-async def hangup_call():
-    """
-    Disconnect the PSTN/SIP caller. Prefer removing the SIP participant;
-    fall back to deleting the room (which disconnects everyone).
-    """
-    ctx = get_job_context()
-    if not ctx:
-        logger.warning("hangup_call(): no job context")
-        return
-
-    lk = ctx.api            # LiveKitAPI client provided by the job
-    room = ctx.room
-
-    # Log participants to make sure we target the SIP leg
-    for p in room.remote_participants.values():
-        logger.info("Remote participant: %s attrs=%s", p.identity, getattr(p, "attributes", {}))
-
-    removed_any = False
-    for p in list(room.remote_participants.values()):
-        attrs = getattr(p, "attributes", {}) or {}
-        if any(k.startswith("sip.") for k in attrs.keys()):
-            try:
-                await lk.room.remove_participant(
-                    room_msgs.RoomParticipantIdentity(room=room.name, identity=p.identity)  # ✅ correct type
-                )
-                logger.info("Removed SIP participant: %s", p.identity)
-                removed_any = True
-            except Exception as e:
-                logger.warning("remove_participant failed for %s: %s", p.identity, e)
-
-    if not removed_any:
-        try:
-            await lk.room.delete_room(  # ✅ this disconnects all participants
-                room_msgs.DeleteRoomRequest(room=room.name)
-            )
-            logger.info("Room deleted via delete_room()")
-        except Exception as e:
-            logger.warning("delete_room failed: %s", e)
             
 
 class AutomotiveBookingAssistant(Agent):
@@ -104,54 +58,60 @@ class AutomotiveBookingAssistant(Agent):
            instructions="""You are a receptionist for Woodbine Toyota. Help customers book appointments.
 
 ## CUSTOMER LOOKUP:
-- At the beginning of the conversation, call lookup_customer function first (We already have customer phone number).
-- lookup_customer returns customer name, car details, or booking details.
+- At the beginning of the conversation, call lookup_customer (We already have customer phone number): returns customer name, car details, or booking details.
 
 ## RULES:
-- After collecting car year make and model: trigger save_customer_information tool
-- After collecting services and transportation: trigger save_services_detail tool
-- After booking: trigger create_appointment
-- Do not say things like "Let me save your information" or "Please wait." Just proceed silently to next step
-- For recall, reschedule appointment or cancel appointment: trigger transfer_call tool
-- For speak with someone, customer service, or user is frustrated: trigger transfer_call tool
+- If the caller asks Spanish, Espagnol, French, Francais, Hindi, etc., call set_language and continue the conversation in that language
 
-- For address: "80 Queens Plate Dr, Etobicoke"
-- For price: "oil change starts at $130 plus tax"
-- For Wait time: "45 minutes to 1 hour"
-- If service is oil change, ask if user needs a cabin air filter replacement or a tire rotation
-- If maintenance, first service or general service: Set is_maintenance to 1
+- After collecting car year make and model: call save_customer_information
+- After collecting services and transportation: call save_services_detail
+- After booking: call create_appointment
+- Do not say things like "Let me save your information" or "Please wait." Just proceed silently to next step
+- For recall, reschedule appointment or cancel appointment: call transfer_call
+- For speak with someone, customer service, or user is frustrated: call transfer_call
+
+- For address: 80 Queens Plate Dr, Etobicoke
+- For price: oil change starts at $130 plus tax
+- For Wait time: 45 minutes to 1 hour
+- Only If user asks if you are a "human" a real person: say "I am actually a voice AI assistant to help you with your service appointment", then Repeat last question
 
 ## Follow this conversation flow:
 
 Step 1. Gather First and Last Name
-- If customer name and car details found: Hello {first_name}! welcome back to Woodbine Toyota. I see you are calling to schedule an appointment. What service would you like for your {year} {model}?. Proceed to Step 3
-- If car details not found: Hello {first_name}! welcome back to Woodbine Toyota. I see you are calling to schedule an appointment. What is your car's year, make, and model?. Proceed to Step 2
-- If customer name not found: Hello! You reached Woodbine Toyota Service. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
+- If customer name and car details found: Hello {first_name}! welcome back to Woodbine Toyota. My name is Sara. I see you are calling to schedule an appointment. What service would you like for your {year} {model}?. Proceed to Step 3
+- If car details not found: Hello {first_name}! welcome back to Woodbine Toyota. My name is Sara. I see you are calling to schedule an appointment. What is your car's year, make, and model?. Proceed to Step 2
+- If customer name not found: Hello! You reached Woodbine Toyota Service. My name is Sara. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
 
 Step 2. Gather vehicle year make and model
 - If first name or last name not captured: What is the spelling of your first name / last name?
 - Once both first name and last name captured, Ask for the vehicle's year make and model? for example, 2025 Toyota Camry
-- call save_customer_information tool
+- call save_customer_information
 
 Step 3. Gather services
-- Ask what services are needed for the vehicle, for example oil change, diagnostics, repairs
+- Ask what services are needed for the vehicle
 - Wait for services
-- Must go to Step 4 before Step 5
+  - If services has oil change, thank user and ask if user needs a cabin air filter replacement or a tire rotation
+  - If services has maintenance, first service or general service: 
+      thank user and ask if user is interested in adding wiper blades during the appointment
+      Set is_maintenance to 1
+  - If user does not know service or wants other services, help them find service, e.g. oil change, diagnostics or repairs
+- Confirm services
 
 Step 4. Gather transportation
-- After capture services, Ask if user will be dropping off the vehicle or waiting while we do the work
+- After capture services, Ask if will be dropping off the vehicle or waiting while we do the work
 - Wait for transportation
-- After services and transportation captured, call save_services_detail tool
 - Must go to Step 5 before Step 6
 
 Step 5. Gather mileage
+- call check_available_slots tool
 - Once transportation captured, Ask what is the mileage
-    - Wait for response
-        - If do not know, proceed to Step 6
-- After transportation captured, call check_available_slots tool
+- Wait for mileage
+    - If user does not know mileage, set mileage to 0
+- call save_services_detail tool
+Proceed to Step 6
 
 Step 6. Offer first availability
-- After services, transportation captured: offer the first availability and ask if that will work, or if the user has a specific time
+- After services, transportation captured: Thank user, offer the first availability and ask if that will work, or if the user has a specific time
 
 Step 7. Find availability
 If first availability works for user, book it
@@ -163,13 +123,13 @@ Else:
         Offer 3 available times and repeat till user finds availability.
             If availability is found, confirm with: Just to be sure, you would like to book ...
     On book:
-        Inform the user they will receive an email or text confirmation shortly. Have a great day and we will see you soon
-        Trigger tool name create_appointment.
-        After triggering create_appointment, say goodbye and the call will automatically end.""",
+        Thank the user and Inform they will receive an email or text confirmation shortly. Have a great day and we will see you soon
+        call create_appointment, after that, say goodbye and the call will automatically end.""",
     )
 
         # Globals
         # Add timeout handler for user silence
+        self._transfer_to              = '<sip:15129007000@x.autoserviceai.voximplant.com;user=phone>'        
         self._session_ref              = session      # keep session for say(), generate_reply(), etc
         self._ctx                      = ctx          # keep context for shutdown, logging, etc
         self._current_state            = getattr(self, "_current_state", None) or "get name"
@@ -177,7 +137,6 @@ Else:
         self._num_timeouts             = 0            # Num of back-to-back timesouts
         self._timeout_task             = None
         self._timeout_gen              = 0            # increases every (re)start/cancel
-        self._num_timeouts             = 0
         self._loop                     = None         # set on first async call
         self._sip_participant_identity = None         # Store SIP participant identity for transfer
         # Keep references so we can stop later
@@ -240,6 +199,23 @@ Else:
             "WAITER": "11111111-1111-1111-1111-111111111111"
         }
         
+        self.voice_by_lang = {
+            "en-US": "zmcVlqmyk3Jpn5AVYcAL",
+            "es":    "jB2lPb5DhAX6l1TLkKXy",
+            "fr":    "BewlJwjEWiFLWoXrbGMf",
+            "hi":    "CpLFIATEbkaZdJr01erZ",
+
+            # Vietnamese (standard + regional alias)
+            "vi":    "8h6XlERYN1nW5v3TWkOQ",
+            "vi-VN": "8h6XlERYN1nW5v3TWkOQ",
+
+            # Chinese (standard + mainland alias). Avoid 'cn' (non-standard), but keep it as a fallback if you like.
+            "zh":    "bhJUNIXWQQ94l8eI2VUf",
+            "zh-CN": "bhJUNIXWQQ94l8eI2VUf",
+            # Optional backward-compat alias:
+            "cn":    "bhJUNIXWQQ94l8eI2VUf",
+        }
+
         # Generate available time slots for next 2 weeks
         self.available_slots = self._generate_available_slots()
         
@@ -289,7 +265,7 @@ Else:
         await asyncio.sleep(max(0.0, delay))
         logger.info("Hanging up call after appointment creation")
         try:
-            await hangup_call()
+            await self.hangup_call()
             logger.info("SIP call hung up (participant removed / room deleted)")
         finally:
             logger.info("Shutting down agent")
@@ -304,7 +280,7 @@ Else:
         logger.info("---Timeout canceled; counters reset")
 
 
-    async def timeout_handler(self):
+    async def timeout_handler(self, gen):
         """Wait; if still idle, issue a state-aware reprompt or escalate."""
         # 1) actually wait
         await asyncio.sleep(self.TIMEOUT_SECONDS)
@@ -318,10 +294,14 @@ Else:
         logger.info(f"timeout_handler: count={self._num_timeouts}, state={self._current_state}")
 
         # 4) escalate on 3rd silence
+        if self._num_timeouts == (self.MAX_TIMEOUTS - 1):
+            logger.info("Timeout skip cycle")
+            return     
+            
         if self._num_timeouts >= self.MAX_TIMEOUTS:
             logger.info("Timeout escalation → transfer_to_number()")
             await self._session_ref.say("Let me connect you to a person.")
-            await self.transfer_to_number("+16506905516")
+            await self.transfer_to_number()
             return
 
         # 5) state-aware reprompts (1st/2nd timeout)
@@ -488,6 +468,48 @@ Else:
         self._background_state.clear()
 
     
+    # Add hangup_call function according to LiveKit documentation
+    async def hangup_call(self):
+        """
+        Disconnect the PSTN/SIP caller. Prefer removing the SIP participant;
+        fall back to deleting the room (which disconnects everyone).
+        """
+        self.cancel_timeout()
+        ctx = get_job_context()
+        if not ctx:
+            logger.warning("hangup_call(): no job context")
+            return
+
+        lk = ctx.api            # LiveKitAPI client provided by the job
+        room = ctx.room
+
+        # Log participants to make sure we target the SIP leg
+        for p in room.remote_participants.values():
+            logger.info("Remote participant: %s attrs=%s", p.identity, getattr(p, "attributes", {}))
+
+        removed_any = False
+        for p in list(room.remote_participants.values()):
+            attrs = getattr(p, "attributes", {}) or {}
+            if any(k.startswith("sip.") for k in attrs.keys()):
+                try:
+                    await lk.room.remove_participant(
+                        room_msgs.RoomParticipantIdentity(room=room.name, identity=p.identity)  # ✅ correct type
+                    )
+                    logger.info("Removed SIP participant: %s", p.identity)
+                    removed_any = True
+                except Exception as e:
+                    logger.warning("remove_participant failed for %s: %s", p.identity, e)
+
+        if not removed_any:
+            try:
+                await lk.room.delete_room(  # ✅ this disconnects all participants
+                    room_msgs.DeleteRoomRequest(room=room.name)
+                )
+                logger.info("Room deleted via delete_room()")
+            except Exception as e:
+                logger.warning("delete_room failed: %s", e)
+
+
     async def transfer_to_number(self):
         """Transfer the call to another number using LiveKit SIP transfer.
         
@@ -496,18 +518,6 @@ Else:
         if self._call_already_transferred:
             logger.info("Call already transferred, skipping")
             return
-            
-        # transfer_to = "+16616811200"  # Hard coded transfer number
-        
-        # Stop background music before transfer
-        # await self.stop_background(self._ctx.room)
-        
-        # Let the agent finish speaking before transfer
-        # current_speech = self._session_ref.current_speech
-        # if current_speech:
-        #     await current_speech.wait_for_playout()
-        
-        # Inform user about transfer
         
         try:
             # Use stored SIP participant identity
@@ -516,11 +526,22 @@ Else:
                 return
             
             logger.info(f"Transferring participant: {self._sip_participant_identity}")
-            async with api.LiveKitAPI() as livekit_api:
-                transfer_to = 'tel:+16506900634'
+            livekit_url = os.getenv('LIVEKIT_URL')
+            api_key = os.getenv('LIVEKIT_API_KEY')
+            api_secret = os.getenv('LIVEKIT_API_SECRET')
+            print("----------------")
+            print(livekit_url)
+            print(api_key)
+            print(api_secret)
+
+            async with api.LiveKitAPI(
+                url=livekit_url,
+                api_key=api_key,
+                api_secret=api_secret
+            ) as livekit_api:
+                transfer_to = self._transfer_to
                 job_ctx = get_job_context()
                 room_name = job_ctx.room.name
-
                 # Create transfer request
                 transfer_request = TransferSIPParticipantRequest(
                     participant_identity=self._sip_participant_identity,
@@ -532,18 +553,7 @@ Else:
 
                 # Transfer caller
                 await livekit_api.sip.transfer_sip_participant(transfer_request)
-            # # Transfer the call using LiveKit API
-            # job_ctx = get_job_context()
-            # await job_ctx.api.sip.transfer_sip_participant(
-            #         api.TransferSIPParticipantRequest(
-            #             room_name=job_ctx.room.name,
-            #             participant_identity=self._sip_participant_identity,
-            #             # to use a sip destination, use `sip:user@host` format
-            #             play_dialtone=True,
-            #             transfer_to=f"tel:{transfer_to}",
-            #         )
-            #     )
-            
+
                 logger.info(f"Call transferred successfully to {transfer_to}")
                 self._call_already_transferred = True
                 
@@ -553,7 +563,6 @@ Else:
             await self._session_ref.generate_reply(
                 instructions="Inform the user that the transfer failed and offer to continue helping them."
             )
-
 
 
     @function_tool
@@ -567,7 +576,6 @@ Else:
         await self.transfer_to_number()
         
         return "I'm transferring you to a human agent. Please hold on."
-
 
 
     @function_tool
@@ -825,10 +833,44 @@ def prewarm(proc: JobProcess):
 
 
 async def entrypoint(ctx: JobContext):
+    # Create timestamp once to use for both recording and transcript
+    recording_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
     # Logging setup
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
+
+    # Set up recording for audio
+    try:
+        req = api.RoomCompositeEgressRequest(
+            room_name=ctx.room.name,
+            audio_only=True,
+            file_outputs=[api.EncodedFileOutput(
+                file_type=api.EncodedFileType.OGG,
+                filepath=f"./{ctx.room.name}_{recording_timestamp}.ogg",
+                s3=api.S3Upload(
+                    bucket=os.getenv('S3_BUCKET_NAME', 'recording-autoservice'),
+                    region=os.getenv('S3_REGION', 'us-east-1'),
+                    access_key=os.getenv('S3_ACCESS_KEY'),
+                    secret=os.getenv('S3_SECRET_KEY'),
+                ),
+            )],
+        )
+
+        livekit_url = os.getenv('LIVEKIT_URL')
+        api_key = os.getenv('LIVEKIT_API_KEY')
+        api_secret = os.getenv('LIVEKIT_API_SECRET')
+
+        async with api.LiveKitAPI(
+            url=livekit_url,
+            api_key=api_key,
+            api_secret=api_secret
+        ) as lkapi:
+            res = await lkapi.egress.start_room_composite_egress(req)
+            logger.info(f"Recording started with egress ID: {res.egress_id}")
+    except Exception as e:
+        logger.error(f"Failed to start recording: {e}")
 
     # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
     session = AgentSession(
@@ -840,12 +882,13 @@ async def entrypoint(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all providers at https://docs.livekit.io/agents/integrations/tts/
         tts=elevenlabs.TTS(
-            voice_id="xcK84VTjd6MHGJo2JVfS",
+            voice_id="zmcVlqmyk3Jpn5AVYcAL", #sapphire
+            #voice_id="xcK84VTjd6MHGJo2JVfS",#cloned
             model="eleven_flash_v2_5",
             api_key="59bb59df13287e23ba2da37ea6e48724",
             voice_settings= VoiceSettings(
                 similarity_boost=0.4,
-                speed=0.94,
+                speed=1,
                 stability=0.3,
                 style=1,
                 use_speaker_boost=True
@@ -867,6 +910,18 @@ async def entrypoint(ctx: JobContext):
             agent.start_timeout()
             logger.info(f"User state changed: {ev.new_state} - Restart Timeout")
 
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev):
+        """Log when conversation items are added"""
+        logger.info(f"Conversation item added: {ev.item.type} - {ev.item.content[0]}...")
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(ev):
+        """Log when user input is transcribed"""
+        logger.info(f"User input transcribed: {ev.transcript}")
+
+    # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
+    # when it's detected, you may resume the agent's speech
     @session.on("transcript")
     def _on_transcript(ev):
         txt = getattr(ev, "text", "") or ""
@@ -906,12 +961,104 @@ async def entrypoint(ctx: JobContext):
         summary = usage_collector.get_summary()
         logger.info(f"Usage: {summary}")
 
+    async def write_transcript():
+        """Save conversation history to JSON file and send to API"""
+        try:
+            # Use the same timestamp as recording
+            current_date = agent._recording_timestamp if hasattr(agent, '_recording_timestamp') else datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"./transcript_{ctx.room.name}_{current_date}.json"
+            
+            # Extract phone number from room name
+            phone_number = extract_phone_from_room_name(ctx.room.name)
+            formatted_phone = f"1{phone_number}" if phone_number else ""
+            
+            # Extract conversations from session history
+            conversations = ["TELEPHONY_WELCOME"]
+            if hasattr(session, 'history') and session.history:
+                history_dict = session.history.to_dict()
+                if 'items' in history_dict:
+                    for item in history_dict['items']:
+                        if 'content' in item and item['content']:
+                            # Get the first content element (usually the text)
+                            content = item['content'][0] if isinstance(item['content'], list) else str(item['content'])
+                            conversations.append(content)
+            
+            # Create record URL
+            record_filename = f"{ctx.room.name}_{current_date}.ogg"
+            record_url = f"https://recording-autoservice.s3.us-east-1.amazonaws.com/{record_filename}"
+            
+            # Create payload for API
+            payload = {
+                "phone": formatted_phone,
+                "agentId": 1,
+                "conversations": conversations,
+                "recordURL": record_url,
+                "transfer": agent._call_already_transferred,
+                "voicemail": False,  # You can modify this based on your logic
+                "booked": agent.appointment_created,
+                "bookingintent": True,  # You can modify this based on your logic
+                "perfect": True,  # You can modify this based on your logic
+                "businessName": "Woodbine Toyota",
+                "customerName": f"{agent.customer_data.get('first_name', '')} {agent.customer_data.get('last_name', '')}".strip(),
+                "serviceOriginal": ", ".join(agent.customer_data.get('services', [])),
+                "carModel": agent.customer_data.get('car_model', ''),
+                "carYear": agent.customer_data.get('car_year', ''),
+                "carMake": agent.customer_data.get('car_make', ''),
+                "advisorNumber": "",
+                "havetimeslots": len(agent.available_slots) > 0,
+                "project_id": "woodbine_toyota",
+                "check_url": "",
+                "book_url": "",
+                "transportation_drop": agent.customer_data.get('transportation', ''),
+                "fallback_service_default": "",
+                "hoursLocation": "80 Queens Plate Dr, Etobicoke"
+            }
+            
+            # Save local transcript file
+            conversation_data = {
+                "room_name": ctx.room.name,
+                "timestamp": datetime.now().isoformat(),
+                "conversation_history": session.history.to_dict(),
+                "customer_data": agent.customer_data,
+                "appointment_created": agent.appointment_created,
+                "call_transferred": agent._call_already_transferred,
+                "api_payload": payload
+            }
+            
+            with open(filename, 'w') as f:
+                json.dump(conversation_data, f, indent=2)
+            
+            logger.info(f"Transcript for {ctx.room.name} saved to {filename}")
+            
+            # Send to API
+            try:
+                async with aiohttp.ClientSession() as session_http:
+                    async with session_http.post(
+                        "https://voxbackend1-cx37agkkhq-uc.a.run.app/add-history",
+                        json=payload,
+                        headers={"Content-Type": "application/json"}
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            logger.info(f"History sent to API successfully: {result}")
+                        else:
+                            logger.error(f"Failed to send history to API: {response.status}")
+                            logger.error(f"Response: {await response.text()}")
+            except Exception as api_error:
+                logger.error(f"Error sending to API: {api_error}")
+                    
+        except Exception as e:
+            logger.error(f"Failed to write transcript: {e}")
+
     ctx.add_shutdown_callback(log_usage)
+    ctx.add_shutdown_callback(write_transcript)
 
     # Create agent instance
     agent = AutomotiveBookingAssistant(session, ctx)
     # Store context reference for shutdown
     agent._ctx = ctx
+    # Store recording timestamp for transcript
+    agent._recording_timestamp = recording_timestamp
 
     # Try to find customer by phone number if available
     phone_number = extract_phone_from_room_name(ctx.room.name)
@@ -949,4 +1096,4 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
-    # agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="my-telephony-agent"))
+    #agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="my-telephony-agent"))

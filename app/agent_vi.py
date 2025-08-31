@@ -1,10 +1,8 @@
-from .app_common import build_session, prewarm, extract_phone_from_room_name, start_recording, VOICE_BY_LANG, MAIN_PROMPT
-from .agent_base import AutomotiveBookingAssistant
+from .app_common import build_session, prewarm, extract_phone_from_room_name, start_recording, VOICE_BY_LANG, COMMON_PROMPT
 import logging
 import aiohttp
 from datetime import datetime, timedelta
 import json
-
 from dotenv import load_dotenv
 from livekit.agents import (
     NOT_GIVEN, Agent, UserStateChangedEvent, AgentFalseInterruptionEvent,
@@ -33,13 +31,19 @@ LLM_MODEL    = "gpt-4o-mini"
 logger = logging.getLogger("agent_vi")
 load_dotenv(".env")
 
-FR_PROMPT    = "You are a professional receptionist for Woodbine Toyota. Answer only in Vietnamese. Help customers book appointments." + MAIN_PROMPT
+MY_PROMPT    = "You are a professional receptionist for Woodbine Toyota. Answer only in Vietnamese. Help customers book appointments." + COMMON_PROMPT
+
+
+
+
+
+
+
 
 
 async def entrypoint(ctx: JobContext):
     lang_switch_q = asyncio.Queue()
     
-    # Logging setup
     ctx.log_context_fields = {"room": ctx.room.name}
 
     session = AgentSession(
@@ -118,32 +122,26 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"Usage: {summary}")
 
     async def write_transcript():
-        """Save conversation history to JSON file and send to API"""
         try:
             # Use the same timestamp as recording
             current_date = agent._recording_timestamp if hasattr(agent, '_recording_timestamp') else datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"./transcript_{ctx.room.name}_{current_date}.json"
             
-            # Extract phone number from room name
             phone_number = extract_phone_from_room_name(ctx.room.name)
             formatted_phone = f"1{phone_number}" if phone_number else ""
             
-            # Extract conversations from session history
             conversations = ["TELEPHONY_WELCOME"]
             if hasattr(session, 'history') and session.history:
                 history_dict = session.history.to_dict()
                 if 'items' in history_dict:
                     for item in history_dict['items']:
                         if 'content' in item and item['content']:
-                            # Get the first content element (usually the text)
                             content = item['content'][0] if isinstance(item['content'], list) else str(item['content'])
                             conversations.append(content)
             
-            # Create record URL
             record_filename = f"{ctx.room.name}_{current_date}.ogg"
             record_url = f"https://recording-autoservice.s3.us-east-1.amazonaws.com/{record_filename}"
             
-            # Create payload for API
             payload = {
                 "phone": formatted_phone,
                 "agentId": 1,
@@ -170,7 +168,6 @@ async def entrypoint(ctx: JobContext):
                 "hoursLocation": "80 Queens Plate Dr, Etobicoke"
             }
             
-            # Save local transcript file
             conversation_data = {
                 "room_name": ctx.room.name,
                 "timestamp": datetime.now().isoformat(),
@@ -186,7 +183,6 @@ async def entrypoint(ctx: JobContext):
             
             logger.info(f"Transcript for {ctx.room.name} saved to {filename}")
             
-            # Send to API
             try:
                 async with aiohttp.ClientSession() as session_http:
                     async with session_http.post(
@@ -209,14 +205,11 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(log_usage)
     ctx.add_shutdown_callback(write_transcript)
 
-    # Create agent instance
-    agent = AutomotiveBookingAssistant(session, ctx, lang_switch_q, instructions=FR_PROMPT)
-    # Store context reference for shutdown
+    agent = AutomotiveBookingAssistant(session, ctx, lang_switch_q, instructions=MY_PROMPT)
     agent._ctx = ctx
 
     await start_recording(ctx, agent)
 
-    # Try to find customer by phone number if available
     phone_number = extract_phone_from_room_name(ctx.room.name)
     if phone_number:
         logger.info(f"Attempting to find customer with phone: {phone_number}")
@@ -228,28 +221,21 @@ async def entrypoint(ctx: JobContext):
         else:
             logger.info("Customer not found, will proceed with normal flow")
     
-    # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
         agent=agent,
         room=ctx.room,
         room_input_options=RoomInputOptions(
-            # LiveKit Cloud enhanced noise cancellation
-            # - If self-hosting, omit this parameter
-            # - For telephony applications, use `BVCTelephony` for best results
             noise_cancellation=noise_cancellation.BVCTelephony(),
             close_on_disconnect=False  # Don't close immediately after transfer
         ),
-
     )
 
     await agent.start_background(ctx.room, "office.mp3")
     await session.generate_reply(
-        instructions=FR_PROMPT
+        instructions=MY_PROMPT
     )
 
-    # Join the room and connect to the user
     await ctx.connect()
-
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))

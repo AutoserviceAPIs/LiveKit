@@ -48,14 +48,13 @@ class AutomotiveBookingAssistant(Agent):
     TIMEOUT_SECONDS = 10
     MAX_TIMEOUTS    = 3         # on the 3rd timeout -> transfer
 
-    def __init__(self, session, ctx, lang_switch_q, *, instructions: str = "" ) -> None:
-        super().__init__(
-           instructions=instructions,
-    )
+    def __init__(self, session, ctx, lang_switch_q=None, *, instructions: str = "", lang: str = "en") -> None:
+        super().__init__(instructions=instructions)
 
         # Globals
         # Add timeout handler for user silence
         self._transfer_to              = '<sip:15129007000@x.autoserviceai.voximplant.com;user=phone>'        
+        self._session                  = session      # keep session for say(), generate_reply(), etc
         self._session_ref              = session      # keep session for say(), generate_reply(), etc
         self._ctx                      = ctx          # keep context for shutdown, logging, etc
         self._current_state            = getattr(self, "_current_state", None) or "get name"
@@ -65,16 +64,30 @@ class AutomotiveBookingAssistant(Agent):
         self._timeout_gen              = 0            # increases every (re)start/cancel
         self._loop                     = None         # set on first async call
         self._sip_participant_identity = None         # Store SIP participant identity for transfer
+        self._supervisor               = lang_switch_q
         self._lang_switch_q            = lang_switch_q
         self._recording_timestamp	   = None
+        self.lang                      = lang
+        self._is_shutting_down         = False
+        self._timeouts                 = 0
+        self.state                     = {"customer": None, "vehicle": None, "progress": None}
         # Keep references so we can stop later
-        self._background_state = {
-            "process": None,
-            "task": None,
-            "track": None,
-            "source": None,
+        self.state = {
+            "customer": None,         # e.g., {"first": "...", "last": "...", "phone": "..."}
+            "vehicle":  None,         # e.g., {"year": "...", "make": "...", "model": "..."}
+            "progress": None,         # e.g., "got_name", "need_service", ...
+            "services": [],           # list of normalized service codes
+            "transportation": None,   # "drop_off" | "wait" | "loaner" | "shuttle"
+            "mileage": None,          # string digits or None
+            "notes": None,            # freeform
         }
-
+        self._background_state = {
+            "process": None,   # e.g., subprocess for bg audio
+            "task": None,      # asyncio.Task if you run a coro
+            "track": None,     # livekit audio track or handle
+            "source": None,    # file/URL/tts source
+            "started_at": None
+        }
         # In-memory storage for customer data and appointments
         self.customer_data = {
             "first_name": "",
@@ -144,6 +157,79 @@ class AutomotiveBookingAssistant(Agent):
         logger.info(f"set_current_state - current_action: {status}")
 
     
+    def _safe_get(self, d, key):
+        return d.get(key) if isinstance(d, dict) else None
+
+
+    def _safe_copy(self, v):
+        # avoid sharing mutable references across processes
+        if isinstance(v, dict):
+            return {k: self._safe_copy(v[k]) for k in v}
+        if isinstance(v, list):
+            return [self._safe_copy(x) for x in v]
+        return v
+
+    def snapshot_state(self) -> dict:
+        """Return a small, serializable snapshot for language handoff."""
+        s = getattr(self, "state", {}) or {}
+        snap = {
+            "customer":      self._safe_copy(self._safe_get(s, "customer")),
+            "vehicle":       self._safe_copy(self._safe_get(s, "vehicle")),
+            "progress":      self._safe_copy(self._safe_get(s, "progress")),
+            "services":      self._safe_copy(self._safe_get(s, "services") or []),
+            "transportation":self._safe_copy(self._safe_get(s, "transportation")),
+            "mileage":       self._safe_copy(self._safe_get(s, "mileage")),
+            "notes":         self._safe_copy(self._safe_get(s, "notes")),
+        }
+        return snap
+
+    def restore_state(self, snapshot: dict | None):
+        """Merge a snapshot back into self.state (used by ES/FR on startup)."""
+        if not isinstance(snapshot, dict):
+            return
+        for k, v in snapshot.items():
+            self.state[k] = self._safe_copy(v)
+
+
+    async def say(self, text: str):
+        """Speak a short line via whatever the session supports."""
+        if self._is_shutting_down:
+            return
+
+        # 1) OpenAI Realtime-style helper (preferred if available)
+        if hasattr(self.session, "response") and hasattr(self.session.response, "create"):
+            return await self.session.response.create({"instructions": text})
+
+        # 2) Generic event sender your wrapper might expose
+        if hasattr(self.session, "send_event"):
+            return await self.session.send_event({
+                "type": "response.create",
+                "response": {"instructions": text}
+            })
+
+        # 3) Direct websocket JSON (if your session has a .ws client)
+        if hasattr(self.session, "ws") and hasattr(self.session.ws, "send_json"):
+            return await self.session.ws.send_json({
+                "type": "response.create",
+                "response": {"instructions": text}
+            })
+
+        # 4) Your own convenience methods (many wrappers expose these)
+        if hasattr(self.session, "say") and callable(self.session.say):
+            return await self.session.say(text)
+
+        if hasattr(self.session, "generate_reply") and callable(self.session.generate_reply):
+            return await self.session.generate_reply(text)
+
+        # 5) Last resort: don’t crash
+        print(f"[AI SAY fallback] {text}")
+        return None
+
+
+    def is_shutting_down(self) -> bool:
+        return self._is_shutting_down
+
+
     async def _ensure_loop(self):
         if not self._loop or not self._loop.is_running():
             self._loop = asyncio.get_running_loop()
@@ -287,21 +373,6 @@ class AutomotiveBookingAssistant(Agent):
                 ]
         
         return slots
-
-
-
-    @function_tool
-    async def set_language(self, lang_phrase: str) -> str:
-        code = resolve_lang_code(lang_phrase)  # use your LANG_SYNONYMS maps
-        if not code:
-            return "Désolé, cette langue n’est pas encore prise en charge."
-
-        if getattr(self, "_current_lang", "en-US") == code:
-            return CONFIRM_BY_LANG.get(code, "OK")
-
-        await self._switch_audio(code)                     # <-- actually switches STT
-        self._current_lang = code
-        return CONFIRM_BY_LANG.get(code, "OK")
 
 
     async def start_background(self, room: rtc.Room, file_path: str):
@@ -535,6 +606,63 @@ class AutomotiveBookingAssistant(Agent):
             await self._session_ref.generate_reply(
                 instructions="Inform the user that the transfer failed and offer to continue helping them."
             )
+
+
+    def bg_set(self, **kwargs):
+        if not hasattr(self, "_background_state") or self._background_state is None:
+            self._background_state = {"process": None, "task": None, "track": None, "source": None, "started_at": None}
+        # only allow known keys
+        for k, v in kwargs.items():
+            if k in self._background_state:
+                self._background_state[k] = v
+
+    def bg_clear(self):
+        if hasattr(self, "_background_state") and self._background_state:
+            for k in list(self._background_state.keys()):
+                self._background_state[k] = None
+
+    async def bg_stop(self):
+        """Best-effort stop of any background resources."""
+        bs = getattr(self, "_background_state", None)
+        if not bs:
+            return
+        # cancel asyncio task
+        task = bs.get("task")
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+        # terminate subprocess
+        proc = bs.get("process")
+        if proc and getattr(proc, "terminate", None):
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        # release track if needed
+        track = bs.get("track")
+        if track and getattr(track, "stop", None):
+            try:
+                track.stop()
+            except Exception:
+                pass
+        self.bg_clear()
+
+        
+    @function_tool
+    async def set_language(self, lang: str) -> str:
+        await self.say("Switching language…")
+        self._is_shutting_down = True
+        snapshot = self.snapshot_state()
+        if not getattr(self, "supervisor", None):
+            # Avoid crashing if supervisor wasn't provided
+            await self.say("Sorry, language switch is not available right now.")
+            return "ERR_NO_SUPERVISOR"
+        await self.supervisor.handoff(lang, state_snapshot=snapshot)
+        await self.shutdown()
+        return "OK"
 
 
     @function_tool

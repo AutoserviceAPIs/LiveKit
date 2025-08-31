@@ -1,4 +1,5 @@
 from .app_common import build_session, prewarm, extract_phone_from_room_name, start_recording, VOICE_BY_LANG, COMMON_PROMPT
+from .agent_base import AutomotiveBookingAssistant
 import logging
 import aiohttp
 from datetime import datetime, timedelta
@@ -31,15 +32,176 @@ LLM_MODEL    = "gpt-4o-mini"
 logger = logging.getLogger("agent_en")
 load_dotenv(".env")
 
-MY_PROMPT    = "You are a professional receptionist for Woodbine Toyota. Help customers book appointments."
-"If caller requests another language (Spanish, French, Hindi), call tool set_language with the requested language" + COMMON_PROMPT
 
-TOOLS = [{
-  "type": "function",
-  "name": "set_language",
-  "parameters": {"type":"object","properties":{"lang":{"type":"string","enum":["es","fr"]}}, "required":["lang"]}
-}]
+MY_PROMPT = f"""You are a professional receptionist for Woodbine Toyota. Help customers book appointments in English only.
+- If caller requests another language (Spanish, French, Hindi), call tool `set_language` with the requested language.
+- After calling the tool, say "Switching to {{language}}…" and stop responding.
+{COMMON_PROMPT}"""
 
+
+TOOLS = [
+    {
+        "type": "function",
+        "name": "set_language",
+        "description": "Handoff to another agent that speaks the requested language.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "lang": {"type": "string", "enum": ["es", "fr", "hi", "vi", "zh"]}
+            },
+            "required": ["lang"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "transfer_call",
+        "description": "Transfer caller to a human agent.",
+        "parameters": {"type": "object", "properties": {}}
+    },
+    {
+        "type": "function",
+        "name": "lookup_customer",
+        "description": "get customer info",
+        "parameters": {"type": "object", "properties": {}}
+    },
+    {
+        "type": "function",
+        "name": "save_customer_information",
+        "description": "Save the customer's name and vehicle details once all are collected.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "first_name": { "type": "string", "minLength": 2, "description": "Customer first name" },
+                "last_name":  { "type": "string", "minLength": 2, "description": "Customer last name" },
+                "car_make":   { "type": "string", "minLength": 2, "description": "Vehicle make, e.g., Toyota" },
+                "car_model":  { "type": "string", "minLength": 1, "description": "Vehicle model, e.g., Camry" },
+                "car_year":   { "type": "string", "pattern": "^(19|20)\\d{2}$", "description": "4-digit model year" }
+            },
+            "required": ["first_name", "last_name", "car_make", "car_model", "car_year"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "save_services_detail",
+        "description": "Persist the selected service(s), transportation choice, and optional mileage.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "array",
+                    "description": "One or more normalized service codes.",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "oil_change", "flat_tire", "tire_balance", "tire_rotation",
+                            "alignment", "filters", "wipers",
+                            "diagnostics", "battery", "ac", "brakes", "key",
+                            "electrical", "inspection", "glass", "software"
+                        ]
+                    },
+                    "minItems": 1,
+                    "uniqueItems": True
+                },
+                "transportation": {
+                    "type": "string",
+                    "description": "How the customer will handle transportation during service.",
+                    "enum": ["drop_off", "wait", "loaner", "shuttle"]
+                },
+                "mileage": {
+                    "type": "string",
+                    "description": "Vehicle mileage as digits only (omit if unknown).",
+                    "pattern": "^[0-9]{1,7}$"
+                }
+            },
+            "required": ["services", "transportation"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "create_appointment",
+        "description": "Create a service appointment with full customer, vehicle, services, and scheduling details.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "first_name": { "type": "string", "minLength": 2, "description": "Customer first name" },
+                "last_name":  { "type": "string", "minLength": 2, "description": "Customer last name" },
+                "car_make":   { "type": "string", "minLength": 2, "description": "Vehicle make, e.g., Toyota" },
+                "car_model":  { "type": "string", "minLength": 1, "description": "Vehicle model, e.g., Camry" },
+                "car_year":   { "type": "string", "pattern": "^(19|20)\\d{2}$", "description": "4-digit model year" },
+
+                "services": {
+                    "type": "array",
+                    "description": "One or more normalized service codes.",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "oil_change","flat_tire","tire_balance","tire_rotation",
+                            "alignment","filters","wipers",
+                            "diagnostics","battery","ac","brakes","key",
+                            "electrical","inspection","glass","software"
+                        ]
+                    },
+                    "minItems": 1,
+                    "uniqueItems": True
+                },
+
+                "transportation": {
+                    "type": "string",
+                    "enum": ["drop_off","wait","loaner","shuttle"],
+                    "description": "Customer transportation choice during service."
+                },
+
+                "services_transcript": {
+                    "type": "string",
+                    "minLength": 3,
+                    "description": "Original free-text description of requested services."
+                },
+
+                "is_maintenance": {
+                    "type": "integer",
+                    "enum": [0, 1],
+                    "description": "1 if maintenance, 0 if repair."
+                },
+
+                "selected_date": {
+                    "type": "string",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                    "description": "Date in YYYY-MM-DD (local dealer timezone)."
+                },
+
+                "selected_time": {
+                    "type": "string",
+                    "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+                    "description": "24h time HH:MM (local dealer timezone)."
+                }
+            },
+            "required": [
+                "first_name","last_name",
+                "car_make","car_model","car_year",
+                "services","transportation",
+                "services_transcript","is_maintenance",
+                "selected_date","selected_time"
+            ],
+            "additionalProperties": False
+        }
+    },
+    {
+        "type": "function",
+        "name": "check_available_slots",
+        "description": "Return available appointment time slots for a given date; if no date is provided, return the earliest upcoming availability.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "preferred_date": {
+                  "type": "string",
+                  "description": "Optional date in YYYY-MM-DD (dealer’s local timezone)."
+                }
+            },
+            "required": [],
+            "additionalProperties": False
+        }
+    }
+]
 
 async def entrypoint(ctx: JobContext):
     lang_switch_q = asyncio.Queue()
@@ -205,7 +367,9 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(log_usage)
     ctx.add_shutdown_callback(write_transcript)
 
-    agent = AutomotiveBookingAssistant(session, ctx, lang_switch_q, instructions=MY_PROMPT)
+    #logger.info(f"Execute Prompt: {MY_PROMPT}")
+
+    agent = AutomotiveBookingAssistant(session, ctx, lang_switch_q, instructions=MY_PROMPT, lang=DEFAULT_LANG)
     agent._ctx = ctx
 
     await start_recording(ctx, agent)

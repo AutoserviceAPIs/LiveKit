@@ -1,4 +1,5 @@
 from .app_common import build_session, prewarm, extract_phone_from_room_name, start_recording, VOICE_BY_LANG, COMMON_PROMPT
+from .agent_base import AutomotiveBookingAssistant
 import logging
 import aiohttp
 from datetime import datetime, timedelta
@@ -31,14 +32,16 @@ LLM_MODEL    = "gpt-4o-mini"
 logger = logging.getLogger("agent_es")
 load_dotenv(".env")
 
-MY_PROMPT    = "You are a professional receptionist for Woodbine Toyota. Answer only in Spanish. Help customers book appointments." + COMMON_PROMPT
+MY_PROMPT = f"""You are a professional receptionist for Woodbine Toyota. Answer only in Spanish. Help customers book appointments.
+{COMMON_PROMPT}"""
 
 
-
-
-
-
-
+async def warm_greeting(self):
+    name = (self.state.get("customer") or {}).get("first")
+    if name:
+        await self.say(f"Hola {name}, ¿prefiere continuar en español?")
+    else:
+        await self.say("Hola, ¿prefiere continuar en español?")
 
 
 async def entrypoint(ctx: JobContext):
@@ -205,7 +208,7 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(log_usage)
     ctx.add_shutdown_callback(write_transcript)
 
-    agent = AutomotiveBookingAssistant(session, ctx, lang_switch_q, instructions=MY_PROMPT)
+    agent = AutomotiveBookingAssistant(session, ctx, lang_switch_q, instructions=MY_PROMPT, lang=DEFAULT_LANG)
     agent._ctx = ctx
 
     await start_recording(ctx, agent)

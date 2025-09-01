@@ -1,6 +1,5 @@
 # your AutomotiveBookingAssistant base class/logic
-from .app_common import LANG_TO_DG, VOICE_BY_LANG, CONFIRM_BY_LANG, normalize_lang
-from .agent_supervisor import LanguageSupervisor
+from .app_common import resolve_lang_code, LANG_TO_DG, VOICE_BY_LANG, CONFIRM_BY_LANG
 from livekit import agents, rtc, api, agents
 from livekit.agents.metrics import TTSMetrics
 from livekit.protocol import room as room_msgs  # ✅ protocol types live here
@@ -14,7 +13,7 @@ from livekit.agents import (
     NOT_GIVEN, Agent, UserStateChangedEvent, AgentFalseInterruptionEvent,
     AgentSession, JobContext, JobProcess, MetricsCollectedEvent,
     RoomInputOptions, WorkerOptions, cli, metrics, get_job_context,)
-import logging, aiohttp, json, os, asyncio, time, subprocess, re, wave
+import logging, aiohttp, json, os, asyncio, time, subprocess, re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
@@ -28,7 +27,6 @@ LANG_SYNONYMS = {
     "hi": ["hindi","hi","हिंदी"],
     "vi": ["vietnamese","viet","vi","tiếng việt","tieng viet"],
     "en-US": ["english","en","inglés","anglais"],
-    "en": ["english","en","inglés","anglais"],
     # Chinese (Mandarin). Avoid non-standard 'cn' but accept it as alias.
     "zh": ["chinese", "mandarin", "zh", "zh-cn", "中文", "普通话", "国语", "cn"],
 }
@@ -38,7 +36,7 @@ class AutomotiveBookingAssistant(Agent):
     TIMEOUT_SECONDS = 10
     MAX_TIMEOUTS    = 3         # on the 3rd timeout -> transfer
 
-    def __init__(self, session, ctx, lang_switch_q=None, *, instructions: str = "", lang: str = "en", supervisor: Optional[object] = None) -> None:
+    def __init__(self, session, ctx, lang_switch_q=None, *, instructions: str = "", lang: str = "en") -> None:
         super().__init__(instructions=instructions)
 
         # Globals
@@ -54,12 +52,22 @@ class AutomotiveBookingAssistant(Agent):
         self._timeout_gen              = 0            # increases every (re)start/cancel
         self._loop                     = None         # set on first async call
         self._sip_participant_identity = None         # Store SIP participant identity for transfer
+        self._supervisor               = lang_switch_q
         self._lang_switch_q            = lang_switch_q
         self._recording_timestamp	   = None
         self._lang                     = lang
         self._is_shutting_down         = False
         self._timeouts                 = 0
-        self.supervisor                = supervisor or lang_switch_q
+        # Keep references so we can stop later
+        self.state = {
+            "customer": None,         # e.g., {"first": "...", "last": "...", "phone": "..."}
+            "vehicle":  None,         # e.g., {"year": "...", "make": "...", "model": "..."}
+            "progress": None,         # e.g., "got_name", "need_service", ...
+            "services": [],           # list of normalized service codes
+            "transportation": None,   # "drop_off" | "wait" | "loaner" | "shuttle"
+            "mileage": None,          # string digits or None
+            "notes": None,            # freeform
+        }
         self.customer_data = {
             "first_name": "",
             "last_name": "",
@@ -138,44 +146,31 @@ class AutomotiveBookingAssistant(Agent):
             return [self._safe_copy(x) for x in v]
         return v
 
-
     def snapshot_state(self) -> dict:
         """Return a small, serializable snapshot for language handoff."""
-        s = getattr(self, "customer_data", {}) or {}
+        s = getattr(self, "state", {}) or {}
         snap = {
-            "phone":                self._safe_copy(self._safe_get(s, "phone")),
-            "first_name":           self._safe_copy(self._safe_get(s, "first_name")),
-            "last_name":            self._safe_copy(self._safe_get(s, "last_name")),
-            "car_year":             self._safe_copy(self._safe_get(s, "car_year")),
-            "car_make":             self._safe_copy(self._safe_get(s, "car_make")),
-            "car_model":            self._safe_copy(self._safe_get(s, "car_model")),
-            "services":             self._safe_copy(self._safe_get(s, "services") or []),
-            "transportation":       self._safe_copy(self._safe_get(s, "transportation")),
-            "mileage":              self._safe_copy(self._safe_get(s, "mileage")),
-            "selected_date":        self._safe_copy(self._safe_get(s, "selected_date")),
-            "selected_time":        self._safe_copy(self._safe_get(s, "selected_time")),
-            "services_transcript":  self._safe_copy(self._safe_get(s, "services_transcript")),
-            "is_maintenance":       self._safe_copy(self._safe_get(s, "is_maintenance")),
+            "customer":      self._safe_copy(self._safe_get(s, "customer")),
+            "vehicle":       self._safe_copy(self._safe_get(s, "vehicle")),
+            "progress":      self._safe_copy(self._safe_get(s, "progress")),
+            "services":      self._safe_copy(self._safe_get(s, "services") or []),
+            "transportation":self._safe_copy(self._safe_get(s, "transportation")),
+            "mileage":       self._safe_copy(self._safe_get(s, "mileage")),
+            "notes":         self._safe_copy(self._safe_get(s, "notes")),
         }
         return snap
 
-
     def restore_state(self, snapshot: dict | None):
-        """Merge a snapshot back into self.customer_data (used by ES/FR on startup)."""
+        """Merge a snapshot back into self.state (used by ES/FR on startup)."""
         if not isinstance(snapshot, dict):
             return
         for k, v in snapshot.items():
-            self.customer_data[k] = self._safe_copy(v)
+            self.state[k] = self._safe_copy(v)
 
 
     async def say(self, text: str):
         """Speak a short line via whatever the session supports."""
         if getattr(self, "_is_shutting_down", False):
-            if hasattr(self.session, "history"):
-                try:
-                    self.session.history.add_assistant_message(text)  # or your equivalent
-                except Exception:
-                    pass
             return
 
         # 1) OpenAI Realtime-style helper (preferred if available)
@@ -264,17 +259,17 @@ class AutomotiveBookingAssistant(Agent):
         await asyncio.sleep(audio_duration + 0.5)
         self.start_timeout()   # ✅ use self.start_timeout()
         log.info(f"Timeout started after {audio_duration}s audio finished")
+
     
     def start_timeout(self):
-        """Start (or restart) the silence timeout."""
-        if getattr(self, "_is_shutting_down", False):
-            return
-        # cancel existing
-        self.cancel_timeout()
-        self._timeout_gen = getattr(self, "_timeout_gen", 0) + 1
+        """Start a new timeout task"""
+        if self._timeout_task and not self._timeout_task.done():
+            self._timeout_task.cancel()
+        self._timeout_gen += 1 
         gen = self._timeout_gen
-        self._timeout_task = asyncio.create_task(self._timeout_loop(gen))
+        self._timeout_task = asyncio.create_task(self.timeout_handler(gen))
         log.info(f"---Timeout started for {self.TIMEOUT_SECONDS}s (gen={gen})")
+
     
     async def delayed_hangup(self, delay: float):
         await asyncio.sleep(max(0.0, delay))
@@ -287,29 +282,13 @@ class AutomotiveBookingAssistant(Agent):
             self._ctx.shutdown(reason="Appointment created successfully")        
 
     def cancel_timeout(self):
-        """Stop any pending silence timeout."""
-        t = getattr(self, "_timeout_task", None)
-        if t and not t.done():
-            t.cancel()
+        if self._timeout_task and not self._timeout_task.done():
+            self._timeout_task.cancel()
         self._timeout_task = None
-        self._num_timeouts = 0
         self._timeout_gen += 1       # invalidate any in-flight handler
+        self._num_timeouts = 0
         log.info("---Timeout canceled; counters reset")
 
-    async def _timeout_loop(self, gen: int):
-        try:
-            await asyncio.sleep(self.TIMEOUT_SECONDS)
-            if getattr(self, "_is_shutting_down", False) or gen != self._timeout_gen:
-                return
-            self._num_timeouts = getattr(self, "_num_timeouts", 0) + 1
-            await self.say("Are you still there?")
-            if self._num_timeouts >= self.MAX_TIMEOUTS:
-                await self.transfer_call()
-            else:
-                # arm next timeout
-                self.start_timeout()
-        except asyncio.CancelledError:
-            pass
 
     async def timeout_handler(self, gen):
         """Wait; if still idle, issue a state-aware reprompt or escalate."""
@@ -453,10 +432,50 @@ class AutomotiveBookingAssistant(Agent):
 
         task = asyncio.create_task(read_audio())
 
-        # store handles so we can stop later (e.g., in transfer_call)
-        self._background_state.update(
-            {"process": process, "task": task, "track": track, "source": source}
+
+    async def _switch_audio(self, code: str) -> None:
+        """Switch STT/TTS to a new language code if the SDK supports it.
+           Falls back to TTS-only if runtime STT switching isn't available.
+        """
+        log.info("_switch_audio")
+        sess = self._session_ref
+
+        # Build new providers
+        new_stt = deepgram.STT(
+            model="nova-3",
+            language=code,
+            interim_results=True,
+            api_key=os.environ["DEEPGRAM_API_KEY"],
         )
+        new_tts = elevenlabs.TTS(
+            model="eleven_flash_v2_5",
+            voice_id=VOICE_BY_LANG.get(code, VOICE_BY_LANG["en-US"]),
+            api_key=os.environ["ELEVEN_API_KEY"],
+        )
+
+        # Try the update API if your SDK has it
+        if hasattr(sess, "update") and callable(sess.update):
+            await sess.update(stt=new_stt, tts=new_tts)
+            log.info("Switched STT/TTS at runtime to %s via session.update()", code)
+            return
+
+        # Older SDKs: no runtime switch. Do TTS-only so the agent still *speaks* the new lang.
+        try:
+            if hasattr(sess, "update") and callable(sess.update):
+                log.info("_switch_audio - update")
+                await sess.update(tts=new_tts)
+            else:
+                # Some builds expose set_tts()
+                if hasattr(sess, "set_tts") and callable(sess.set_tts):
+                    log.info("_switch_audio - set_tts")
+                    await sess.set_tts(new_tts)
+            logger.warning(
+                "Runtime STT switching not supported in this SDK. "
+                "Applied TTS voice for %s; STT will remain previous language until session restart.",
+                code,
+            )
+        except Exception as e:
+            logger.warning("Could not switch TTS at runtime: %s", e)
 
     
     # Add hangup_call function according to LiveKit documentation
@@ -468,7 +487,7 @@ class AutomotiveBookingAssistant(Agent):
         self.cancel_timeout()
         ctx = get_job_context()
         if not ctx:
-            log.warning("hangup_call(): no job context")
+            logger.warning("hangup_call(): no job context")
             return
 
         lk = ctx.api            # LiveKitAPI client provided by the job
@@ -489,7 +508,7 @@ class AutomotiveBookingAssistant(Agent):
                     log.info("Removed SIP participant: %s", p.identity)
                     removed_any = True
                 except Exception as e:
-                    log.warning("remove_participant failed for %s: %s", p.identity, e)
+                    logger.warning("remove_participant failed for %s: %s", p.identity, e)
 
         if not removed_any:
             try:
@@ -498,7 +517,7 @@ class AutomotiveBookingAssistant(Agent):
                 )
                 log.info("Room deleted via delete_room()")
             except Exception as e:
-                log.warning("delete_room failed: %s", e)
+                logger.warning("delete_room failed: %s", e)
 
 
     async def transfer_to_number(self):
@@ -513,7 +532,7 @@ class AutomotiveBookingAssistant(Agent):
         try:
             # Use stored SIP participant identity
             if not self._sip_participant_identity:
-                log.error("SIP participant identity not found")
+                logger.error("SIP participant identity not found")
                 return
             
             log.info(f"Transferring participant: {self._sip_participant_identity}")
@@ -540,7 +559,7 @@ class AutomotiveBookingAssistant(Agent):
                     transfer_to=transfer_to,
                     play_dialtone=True
                 )
-                log.debug(f"Transfer request: {transfer_request}")
+                logger.debug(f"Transfer request: {transfer_request}")
 
                 # Transfer caller
                 await livekit_api.sip.transfer_sip_participant(transfer_request)
@@ -549,7 +568,7 @@ class AutomotiveBookingAssistant(Agent):
                 self._call_already_transferred = True
                 
         except Exception as e:
-            log.error(f"Error transferring call: {e}")
+            logger.error(f"Error transferring call: {e}")
             # Give the LLM context about the failure
             await self._session_ref.generate_reply(
                 instructions="Inform the user that the transfer failed and offer to continue helping them."
@@ -571,67 +590,17 @@ class AutomotiveBookingAssistant(Agent):
 
     @function_tool
     async def set_language(self, lang: str) -> str:
-        if getattr(self, "_handoff_inflight", False):
-            return "BUSY"
-
-        canon = normalize_lang(lang)  # "French" -> "fr"
-        SUPPORTED = {"es", "fr"}
-        if canon not in SUPPORTED:
-            await self.say("Sorry, that language isn’t available right now.")
-            return "ERR_UNSUPPORTED_LANG"
-
-        if canon == getattr(self, "lang", "en"):
-            return "OK"
-
-        await self.say(f"Please wait while I get you my {lang} colleague …")
-
-        self._handoff_inflight = True
+        await self.say("Switching to Spanish…" if lang=="es" else "Passage au français…")
         self._is_shutting_down = True
-        try:
-            try:
-                self.cancel_timeout()
-            except Exception:
-                pass
-            if hasattr(self, "bg_stop"):
-                try: await self.bg_stop()
-                except Exception: pass
+        if getattr(self, "_timeout_task", None):
+            try: self._timeout_task.cancel()
+            except: pass
+            self._timeout_task = None
 
-            if not getattr(self, "supervisor", None):
-                room = getattr(getattr(self._ctx, "room", None), "name", None)
-                if not room:
-                    self._is_shutting_down = False
-                    return "ERR_NO_SUPERVISOR"
-                self.supervisor = LanguageSupervisor(room=room, ready_timeout=12.0)
-
-            try:
-                snapshot = self.snapshot_state()
-            except Exception:
-                snapshot = {
-                    "state": getattr(self, "state", {}),
-                    "customer_data": getattr(self, "customer_data", {}),
-                    "available_slots": getattr(self, "available_slots", []),
-                }
-
-            # ⬇️ If handoff is slow, DO NOT speak failure—just return and stay muted
-            try:
-                await self.supervisor.handoff(canon, state_snapshot=snapshot)
-            except TimeoutError:
-                # FR agent may still be starting; keep EN silent and let FR greet when ready
-                return "PENDING"
-
-            # Child is READY → shut down EN
-            try: await self.shutdown()
-            except Exception: pass
-            return "OK"
-
-        except Exception as e:
-            # Hard failure: allow EN to resume talking
-            self._is_shutting_down = False
-            await self.say("I couldn’t switch languages right now. We can continue here or I can transfer you to a person.")
-            return f"ERR_HANDOFF_FAILED:{e}"
-
-        finally:
-            self._handoff_inflight = False
+        snapshot = self.snapshot_state()
+        await self.supervisor.handoff(lang, state_snapshot=snapshot)  # <- spawns ES/FR & waits READY
+        await self.shutdown()
+        return "OK"
 
 
     @function_tool
@@ -835,7 +804,7 @@ class AutomotiveBookingAssistant(Agent):
             if len(clean_phone) >= 10:
                 phone_10_digits = clean_phone[-10:]
             else:
-                log.error(f"Invalid phone number: {phone}")
+                logger.error(f"Invalid phone number: {phone}")
                 return False
             
             # Call API to find customer
@@ -854,7 +823,7 @@ class AutomotiveBookingAssistant(Agent):
                             # Try to parse as JSON
                             result = json.loads(response_text)
                         except json.JSONDecodeError:
-                            log.error(f"Failed to parse JSON response: {response_text}")
+                            logger.error(f"Failed to parse JSON response: {response_text}")
                             return False
                         
                         # Check if customer found
@@ -879,9 +848,9 @@ class AutomotiveBookingAssistant(Agent):
                             log.info(f"Customer not found for phone: {phone_10_digits}")
                             return False
                     else:
-                        log.error(f"API call failed with status {response.status}")
+                        logger.error(f"API call failed with status {response.status}")
                         return False
                         
         except Exception as error:
-            log.error(f"Customer lookup error: {error}")
+            logger.error(f"Customer lookup error: {error}")
             return False

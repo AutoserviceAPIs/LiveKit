@@ -1,32 +1,40 @@
-#TODO:
-#VAD: reduce sensitivity / languages
-#Languages
-
-#Fixed hangup
-#User does not know service / are you real?
-#Fixed timeout: transfer call on silence
-#Moved transfer_to to self._transfer_to
-#I set preemptive_generation=False,
+# agent runtime wiring shared by all languages.
+# builds the AgentSession (LLM/STT/TTS) for a given lang
+# attaches common event handlers (timeouts, metrics, logging)
+# reads handoff snapshot, signals READY, plays background, sends greeting
+# exposes run_language_agent_entrypoint(ctx, lang)
 
 from __future__ import annotations  # optional, but nice to have in 3.11+
-import logging
-
-from livekit.agents import JobContext, AgentSession
 from dotenv import load_dotenv
-from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
 from livekit import api
+from livekit.agents import JobContext, AgentSession
+from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
 from datetime import datetime, timedelta
-import re
-import os
-
-
+import json, logging, aiohttp, re, os
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .agent_base import AutomotiveBookingAssistant
 
-logger = logging.getLogger("agent")
+log = logging.getLogger("agent_common")
 load_dotenv(".env")
   
+VOICE_BY_LANG = { 
+    "en" :   "aEO01A4wXwd1O8GPgGlF", #Arabella
+    "fr" :   "aEO01A4wXwd1O8GPgGlF", #Arabella
+    "es" :   "aEO01A4wXwd1O8GPgGlF", #Arabella
+    "vi" :   "aEO01A4wXwd1O8GPgGlF", #Arabella
+    "hi" :   "aEO01A4wXwd1O8GPgGlF", #Arabella
+#    "en":    "zmcVlqmyk3Jpn5AVYcAL",
+#    "es":    "jB2lPb5DhAX6l1TLkKXy",
+#    "fr":    "BewlJwjEWiFLWoXrbGMf",
+#    "hi":    "CpLFIATEbkaZdJr01erZ",
+#    "vi":    "8h6XlERYN1nW5v3TWkOQ",
+#    "zh":    "bhJUNIXWQQ94l8eI2VUf",
+#    "cn":    "bhJUNIXWQQ94l8eI2VUf",
+}
+
+
+
 COMMON_PROMPT = """You are a booking assistant. Help customers book appointments.
 
 ## CUSTOMER LOOKUP:
@@ -115,12 +123,14 @@ LANG_SYNONYMS = {
     "hi": ["hindi","hi","हिंदी"],
     "vi": ["vietnamese","viet","vi","tiếng việt","tieng viet"],
     "en-US": ["english","en","inglés","anglais"],
+    "en": ["english","en","inglés","anglais"],
     # Chinese (Mandarin). Avoid non-standard 'cn' but accept it as alias.
     "zh": ["chinese", "mandarin", "zh", "zh-cn", "中文", "普通话", "国语", "cn"],
 }
 
 CONFIRM_BY_LANG = {
     "en-US": "Okay, I’ll continue in English.",
+    "en":    "Okay, I’ll continue in English.",
     "es":    "De acuerdo, continuaré en español.",
     "fr":    "D’accord, je continue en français.",
     "hi":    "ठीक है, मैं हिंदी में जारी रखूँगा।",
@@ -134,6 +144,7 @@ SUPPORTED_STT_LANGS = {"en-US","es","fr","hi","vi","vi-VN","zh","zh-CN"}
 
 DG_CODE = {
     "en-US": "en-US",
+    "en-US": "en",
     "es":    "es",
     "fr":    "fr",
     "hi":    "hi",
@@ -142,131 +153,34 @@ DG_CODE = {
 }
 
 
-VOICE_BY_LANG = {
-    "en-US": "zmcVlqmyk3Jpn5AVYcAL",
-    "es":    "jB2lPb5DhAX6l1TLkKXy",
-    "fr":    "BewlJwjEWiFLWoXrbGMf",
-    "hi":    "CpLFIATEbkaZdJr01erZ",
-
-    # Vietnamese (standard + regional alias)
-    "vi":    "8h6XlERYN1nW5v3TWkOQ",
-    "vi-VN": "8h6XlERYN1nW5v3TWkOQ",
-
-    # Chinese (standard + mainland alias). Avoid 'cn' (non-standard), but keep it as a fallback if you like.
-    "zh":    "bhJUNIXWQQ94l8eI2VUf",
-    "zh-CN": "bhJUNIXWQQ94l8eI2VUf",
-    # Optional backward-compat alias:
-    "cn":    "bhJUNIXWQQ94l8eI2VUf",
-}
-
-
-def build_session(ctx: JobContext, lang: str) -> AgentSession:
-    llm = ctx.proc.userdata.get("llm") or openai.LLM(model=LLM_MODEL)
-    vad = ctx.proc.userdata.get("vad") or silero.VAD.load()
-
-    stt_lang = lang if lang in SUPPORTED_STT_LANGS else "en-US"
-    stt = deepgram.STT(
-        model="nova-3",
-        language=stt_lang,
-        interim_results=True,
-        api_key=os.environ["DEEPGRAM_API_KEY"],
-    )
-    tts = elevenlabs.TTS(
-        voice_id=VOICE_BY_LANG.get(stt_lang, VOICE_BY_LANG["en-US"]),
-        model="eleven_flash_v2_5",
-        api_key=os.environ["ELEVEN_API_KEY"],
-        voice_settings=VoiceSettings(
-            similarity_boost=0.4, speed=1.0, stability=0.3, style=1.0, use_speaker_boost=True
-        ),
-    )
-
-    return AgentSession(
-        llm=llm,
-        stt=stt,
-        tts=tts,
-        turn_detection=MultilingualModel(),
-        vad=vad,
-        preemptive_generation=False,
-    )
-
-
 # Extract phone number from room name
 def extract_phone_from_room_name(room_name: str) -> str:
     """Extract phone number from room name format: call-_8055057710_uHsvtynDWWJN"""
+    log.info(f"extract_phone_from_room_name {room_name}")
     pattern = r'call-_(\d+)_'
     match = re.search(pattern, room_name)
     return match.group(1) if match else ""
-            
-
-def make_session(lang: str, ctx) -> AgentSession:
-    return AgentSession(
-        llm=ctx.llm,
-        stt=deepgram.STT(
-            model="nova-3",
-            language=lang,
-            interim_results=True,
-            api_key=os.environ["DEEPGRAM_API_KEY"],
-        ),
-        tts=elevenlabs.TTS(
-            model="eleven_flash_v2_5",
-            voice_id=VOICE_BY_LANG.get(lang, VOICE_BY_LANG["en-US"]),
-            api_key=os.environ["ELEVEN_API_KEY"],
-        ),
-        turn_detection=ctx.turn_detection,
-        vad=ctx.proc.userdata["vad"],
-        preemptive_generation=False,
-        instructions="You are a voice AI assistant for Woodbine Toyota…",
-    )
 
 
-async def handle_user_text(self, text: str | None, is_final: bool = True):
-    logger.info("STT is_final=%s text=%s", is_final, text)
-    s = (text or "").strip()
-    if not s:
-        return
-
-    # 1) Fast path: detect a language **request** (works on partials or finals)
-    code = detect_requested_lang(s)               # returns e.g. "fr","es","hi","vi","zh","en-US" or None
-    current = getattr(self, "_current_lang", "en-US")
-    if code and code != current:
-        await self.set_language(code)             # <-- pass the CODE
-        self._current_lang = code
-        return  # let the next utterance be recognized with the new STT
-
-    # 2) On final transcripts, try a more permissive resolve (aliases, miss-hearings)
-    if is_final:
-        code2 = resolve_lang_code(s)              # same normalized codes or None
-        if code2 and code2 != current:
-            await self.set_language(code2)        # <-- pass the CODE
-            self._current_lang = code2
-            return
-
-    # 3) …continue with your normal handling here…
-    # await self.route_user_intent(s)
-
-
-async def handle_user_text(self, text: str, is_final: bool = True):
-    logger.info(f"handle_user_text - str: {str}")
-    # 1) Detect requested language
-    code = resolve_lang_code(text)             # <-- now 'code' is defined here
-    if code and code != getattr(self, "_current_lang", "en-US"):
-        await self.set_language(code)          # pass the CODE, not the phrase
-        self._current_lang = code
-        return  # let the next utterance use the new STT
-
-
-async def lang_switch_loop(session_builder, agent, lang_q):
-    logger.info(f"lang_switch_loop - lang_q: {lang_q}")
-    current_session = await session_builder("en-US")
-    agent.bind_session(current_session)
-    while True:
-        code = await lang_q.get()
-        await current_session.aclose()                 # stop current pipelines
-        current_session = await session_builder(code)  # build with new STT/TTS
-        agent.bind_session(current_session)            # re-bind
+def normalize_lang(label: str) -> str:
+    if not label:
+        return ""
+    k = label.strip().lower().replace("_", "-")
+    # exact code match first
+    for code in ("es", "fr", "en"):
+        if k == code or k.startswith(code + "-"):
+            return code
+    # synonym match
+    for code, names in LANG_SYNONYMS.items():
+        if k in names:
+            return code
+    # last resort: two-letter if supported
+    short = k[:2]
+    return short if short in ("es", "fr", "en") else k
 
 
 async def start_recording(ctx: JobContext, agent):
+    log.info(f"start_recording")
     # 1) Make sure we are connected/joined
     await ctx.connect()
 
@@ -304,41 +218,91 @@ async def start_recording(ctx: JobContext, agent):
     await ctx.api.egress.start_room_composite_egress(req)
 
 
-def normalize_lang_code(text: str) -> str:
-    s = (text or "").strip().lower()
-    # direct tags first
-    if s in ("en-us","en"): return "en-US"
-    for code, words in LANG_SYNONYMS.items():
-        if s in words:
-            return "en-US" if code == "en" else code
-    # crude keyword fallbacks
-    if any(k in s for k in ["franc", "franç", "french"]): return "fr"
-    if any(k in s for k in ["espa", "spani"]):            return "es"
-    if "हिं" in s or "hindi" in s:                         return "hi"
-    if "viet" in s or "việt" in s:                         return "vi"
-    if "中文" in s or "mandarin" in s or "zh" in s:         return "zh"
-    return "en-US"
-
-
-def detect_requested_lang(text: str) -> str | None:
-    logger.info(f"detect_requested_lang - str: {str}")
-    s = (text or "").lower()
-    for code, words in LANG_SYNONYMS.items():
-        if any(w in s for w in words):
-            return "en-US" if code == "en" else code
-    return None
-
-
-def resolve_lang_code(lang_phrase: str) -> str | None:
-    p = (lang_phrase or "").strip().lower()
-    for code, words in LANG_SYNONYMS.items():
-        if p in words or any(w in p for w in words):
-            return code
-    return None
-
-
 def prewarm(proc: JobProcess):
+    log.info(f"prewarm")
     if "vad" not in proc.userdata:
         proc.userdata["vad"] = silero.VAD.load()
     if "llm" not in proc.userdata:
         proc.userdata["llm"] = openai.LLM(model=LLM_MODEL)
+
+
+def register_transcript_writer(ctx, session, agent, *,
+                               business_name="Woodbine Toyota",
+                               project_id="woodbine_toyota",
+                               hours_location="80 Queens Plate Dr, Etobicoke",
+                               api_url="https://voxbackend1-cx37agkkhq-uc.a.run.app/add-history"):
+    async def write_transcript():
+        try:
+            current_date = getattr(agent, '_recording_timestamp', None) or datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"./transcript_{ctx.room.name}_{current_date}.json"
+
+            phone_number = extract_phone_from_room_name(ctx.room.name)
+            formatted_phone = f"1{phone_number}" if phone_number else ""
+
+            conversations = ["TELEPHONY_WELCOME"]
+            if getattr(session, 'history', None) and session.history:
+                hist = session.history.to_dict()
+                for item in hist.get('items', []):
+                    content = item.get('content')
+                    if content:
+                        content0 = content[0] if isinstance(content, list) else str(content)
+                        conversations.append(content0)
+
+            record_filename = f"{ctx.room.name}_{current_date}.ogg"
+            record_url = f"https://recording-autoservice.s3.us-east-1.amazonaws.com/{record_filename}"
+
+            payload = {
+                "phone": formatted_phone,
+                "agentId": 1,
+                "conversations": conversations,
+                "recordURL": record_url,
+                "transfer": getattr(agent, "_call_already_transferred", False),
+                "voicemail": False,
+                "booked": getattr(agent, "appointment_created", False),
+                "bookingintent": True,
+                "perfect": True,
+                "businessName": business_name,
+                "customerName": f"{agent.customer_data.get('first_name','')} {agent.customer_data.get('last_name','')}".strip(),
+                "serviceOriginal": ", ".join(agent.customer_data.get('services', [])),
+                "carModel": agent.customer_data.get('car_model', ''),
+                "carYear": agent.customer_data.get('car_year', ''),
+                "carMake": agent.customer_data.get('car_make', ''),
+                "advisorNumber": "",
+                "havetimeslots": len(getattr(agent, "available_slots", [])) > 0,
+                "project_id": project_id,
+                "check_url": "",
+                "book_url": "",
+                "transportation_drop": agent.customer_data.get('transportation', ''),
+                "fallback_service_default": "",
+                "hoursLocation": hours_location,
+            }
+
+            conversation_data = {
+                "room_name": ctx.room.name,
+                "timestamp": datetime.now().isoformat(),
+                "conversation_history": session.history.to_dict() if getattr(session, 'history', None) else {},
+                "customer_data": getattr(agent, "customer_data", {}),
+                "appointment_created": getattr(agent, "appointment_created", False),
+                "call_transferred": getattr(agent, "_call_already_transferred", False),
+                "api_payload": payload,
+            }
+
+            with open(filename, 'w') as f:
+                json.dump(conversation_data, f, indent=2)
+
+            log.info(f"Transcript saved to {filename}")
+
+            try:
+                async with aiohttp.ClientSession() as session_http:
+                    async with session_http.post(api_url, json=payload, headers={"Content-Type": "application/json"}) as resp:
+                        if resp.status == 200:
+                            log.info(f"History sent OK: {await resp.json()}")
+                        else:
+                            logger.error(f"History send failed: {resp.status} {await resp.text()}")
+            except Exception as api_err:
+                logger.error(f"Error sending to API: {api_err}")
+
+        except Exception as e:
+            logger.error(f"Failed to write transcript: {e}")
+
+    ctx.add_shutdown_callback(write_transcript)

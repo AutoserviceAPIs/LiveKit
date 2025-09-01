@@ -1,5 +1,10 @@
+#TO BE CHANGED
+#   findCustomer: If find appointment
+#   reschedule_appointment
+#   cancel_appointment
+
 # your AutomotiveBookingAssistant base class/logic
-from .app_common import LANG_TO_DG, VOICE_BY_LANG, CONFIRM_BY_LANG, normalize_lang
+from .app_common import CONFIRM_BY_LANG, normalize_lang
 from .agent_supervisor import LanguageSupervisor
 from livekit import agents, rtc, api, agents
 from livekit.agents.metrics import TTSMetrics
@@ -21,17 +26,6 @@ from dotenv import load_dotenv
 
 log = logging.getLogger("agent")
 load_dotenv(".env")
-
-LANG_SYNONYMS = {
-    "fr": ["french","francais","français","fr", "fransay","fransais","frances","en français","parlez français"],
-    "es": ["spanish","espanol","español","es","en español","habla español","puedes hablar español"],
-    "hi": ["hindi","hi","हिंदी"],
-    "vi": ["vietnamese","viet","vi","tiếng việt","tieng viet"],
-    "en-US": ["english","en","inglés","anglais"],
-    "en": ["english","en","inglés","anglais"],
-    # Chinese (Mandarin). Avoid non-standard 'cn' but accept it as alias.
-    "zh": ["chinese", "mandarin", "zh", "zh-cn", "中文", "普通话", "国语", "cn"],
-}
 
 
 class AutomotiveBookingAssistant(Agent):
@@ -60,6 +54,8 @@ class AutomotiveBookingAssistant(Agent):
         self._is_shutting_down         = False
         self._timeouts                 = 0
         self.supervisor                = supervisor or lang_switch_q
+        self._background_state         = {"task": None, "source": None}
+        self._found_appt_id            = 0            #If appointment is found
         self.customer_data = {
             "first_name": "",
             "last_name": "",
@@ -73,7 +69,8 @@ class AutomotiveBookingAssistant(Agent):
             "selected_date": None,
             "selected_time": None,
             "services_transcript": "",
-            "is_maintenance": 0
+            "is_maintenance": 0,
+            "appointment_id": 0
         }        
         self.service_mapping = {
             "oil change": "2OILCHANGE",
@@ -112,10 +109,6 @@ class AutomotiveBookingAssistant(Agent):
 
         # Generate available time slots for next 2 weeks
         self.available_slots = self._generate_available_slots()
-        
-        # API URLs
-        self.CHECK_URL = "https://api.example.com/check"  # Replace with your actual API URL
-        self.CARS_URL = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/get"    # Replace with your actual API URL
         
         # Flag to track if appointment was created
         self.appointment_created = False
@@ -156,6 +149,9 @@ class AutomotiveBookingAssistant(Agent):
             "selected_time":        self._safe_copy(self._safe_get(s, "selected_time")),
             "services_transcript":  self._safe_copy(self._safe_get(s, "services_transcript")),
             "is_maintenance":       self._safe_copy(self._safe_get(s, "is_maintenance")),
+            "appointment_id":       self._safe_copy(self._safe_get(s, "appointment_id")),
+            "appointment_date":     self._safe_copy(self._safe_get(s, "appointment_date")),
+            "appointment_time":     self._safe_copy(self._safe_get(s, "appointment_time")),
         }
         return snap
 
@@ -355,19 +351,24 @@ class AutomotiveBookingAssistant(Agent):
             await self._session_ref.say(reprompt)
 
         elif self._current_state == "get transportation":
-            reprompt = (f"Are you still there {first_name}? Would you like to drop off your vehicle "
+            reprompt = (f"Are you still there {first_name}? Would you like to drop off your vehicle"
                         "or wait at the dealership?")
             self._current_state = "first availability"
             await self._session_ref.say(reprompt)
 
         elif self._current_state == "first availability":
             # For availability, you wanted LLM to “repeat availability”
-            reprompt = "Ask if user is still there. Repeat availability."
+            reprompt = "Ask if user is still there. Repeat availability"
             self._current_state = "check availability"
             await self._session_ref.generate_reply(instructions=reprompt)
 
         elif self._current_state == "check availability":
-            reprompt = "Ask if user is still there. Repeat availability."
+            reprompt = "Ask if user is still there. Repeat availability"
+            # stay in "check availability"
+            await self._session_ref.generate_reply(instructions=reprompt)
+
+        elif self._current_state == "cancel reschedule":
+            reprompt = "Ask if user would like to reschedule"
             # stay in "check availability"
             await self._session_ref.generate_reply(instructions=reprompt)
 
@@ -583,7 +584,8 @@ class AutomotiveBookingAssistant(Agent):
         if canon == getattr(self, "lang", "en"):
             return "OK"
 
-        await self.say(f"Please wait while I get you my {lang} colleague …")
+        #await self.say(f "Please wait while I get you my {lang} colleague …")
+        await self.say(CONFIRM_BY_LANG[lang])
 
         self._handoff_inflight = True
         self._is_shutting_down = True
@@ -782,6 +784,73 @@ class AutomotiveBookingAssistant(Agent):
         return f"Appointment confirmed! Your appointment ID is {appointment_id}. You have service scheduled for {selected_date} at {selected_time}. We'll send a confirmation message shortly. Have a great day!"
 
 
+    #TO BE CHANGED
+    @function_tool
+    async def reschedule_appointment(self, context: RunContext, appointment_id: str, first_name: str, last_name: str,
+                               car_make: str, car_model: str, car_year: str, services: List[str],
+                               transportation: str, services_transcript: str, is_maintenance: int,
+                               selected_date: str, selected_time: str) -> str:
+        """reschedule an booking appointment.
+        
+        Args:
+            appointment_id
+            first_name: Customer's first name
+            last_name: Customer's last name
+            car_make: Car make
+            car_model: Car model
+            car_year: Car year
+            services: List of services requested
+            transportation: Drop off or wait
+            services_transcript: Transcript of the request for services
+            is_maintenance: Whether this is a maintenance service (0 or 1)
+            selected_date: Selected appointment date in YYYY-MM-DD format
+            selected_time: Selected appointment time in HH:mm:ss format
+        """
+        log.info(f"Rescheduling appointment for {first_name} {last_name} on {selected_date} at {selected_time}")
+        
+
+        # Remove the slot from available slots
+        # self.available_slots[selected_date].remove(selected_time)
+        
+        # Store appointment details
+        appointment_data = {
+            "appointment_id": appointment_id,
+            "customer_name": f"{first_name} {last_name}",
+            "car_info": f"{car_year} {car_make} {car_model}",
+            "services": services,
+            "services_transcript": services_transcript,
+            "transportation": transportation,
+            "is_maintenance": is_maintenance,
+            "date": selected_date,
+            "time": selected_time,
+            "status": "confirmed",
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # In a real implementation, you would save this to a database
+        log.info(f"Appointment created: {json.dumps(appointment_data)}")
+        
+        # Set flag to indicate appointment was created - this will trigger hangup after goodbye
+        self.appointment_created = True
+        
+        # Set flag to indicate appointment was created - this will trigger hangup after goodbye
+        self.appointment_created = True
+        
+        return f"Appointment rescheduled! Your service is rescheduled for {selected_date} at {selected_time}. We'll send a confirmation message shortly. Have a great day!"
+
+
+    #TO BE CHANGED
+    @function_tool
+    async def cancel_appointment(self, context: RunContext, appointment_id: str) -> str:
+        """cancel appointment.
+        
+        Args:
+            appointment_id
+        """
+        log.info(f"cancel_appointment for {first_name} {last_name} on {selected_date} at {selected_time}")        
+        return f"Appointment cancelled! We'll send a confirmation message shortly. Have a great day!"
+
+
     @function_tool(name="lookup_customer", description="Look up customer by phone number already on file.")
     async def lookup_customer(self, context: RunContext, phone: str) -> str:
         """Look up customer information by phone number.
@@ -799,14 +868,23 @@ class AutomotiveBookingAssistant(Agent):
             self.customer_data["car_year"]):
             
             # Customer found, create response from existing customer_data
+            response = f"Found customer record with name: {self.customer_data['first_name']} {self.customer_data['last_name']} with car {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}" 
+
+            # check if self._found_appt_id is set
+            if (self._found_appt_id):
+                response = f"Found customer record with appointment_id: {self.customer_data['appointment_id']} name: {self.customer_data['first_name']} {self.customer_data['last_name']} with car {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}" 
+
             result = {
-                "success": True,
-                "firstName": self.customer_data["first_name"],
-                "lastName": self.customer_data["last_name"],
-                "make": self.customer_data["car_make"],
-                "model": self.customer_data["car_model"],
-                "year": self.customer_data["car_year"],
-                "message": f"Found customer record with name: {self.customer_data['first_name']} {self.customer_data['last_name']} with car {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}"                
+                "success":          True,
+                "firstName":        self.customer_data["first_name"],
+                "lastName":         self.customer_data["last_name"],
+                "make":             self.customer_data["car_make"],
+                "model":            self.customer_data["car_model"],
+                "year":             self.customer_data["car_year"],
+                "appointment_id":   self.customer_data["appointment_id"],
+                "appointment_date": self.customer_data["appointment_date"],
+                "appointment_time": self.customer_data["appointment_time"],
+                "message": response               
             }
             # Store the lookup result for later use
             return json.dumps(result)
@@ -815,73 +893,4 @@ class AutomotiveBookingAssistant(Agent):
                 "success": False,
                 "message": "Customer not found in our system. Please ask customer information."
             }
-            return json.dumps(result)  
-
-    async def findCustomer(self, phone: str) -> bool:
-        """Find customer by phone number and populate customer_data.
-        
-        This function works like the lookupCustomer in BOOKING_ASSISTANT.md
-        - Calls API to find customer by phone number
-        - Populates customer_data if found
-        - Returns True if found, False otherwise
-        
-        Args:
-            phone: Customer's phone number
-        """
-        log.info(f"---FindCustomer with phone: {phone}")
-        try:
-            # Get last 10 digits of phone number
-            clean_phone = ''.join(filter(str.isdigit, phone))
-            if len(clean_phone) >= 10:
-                phone_10_digits = clean_phone[-10:]
-            else:
-                log.error(f"Invalid phone number: {phone}")
-                return False
-            
-            # Call API to find customer
-            url = self.CARS_URL
-            params = {"phone": phone_10_digits}
-            log.info(f"Calling API: {url} with params: {params}")
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params) as response:
-                    if response.status == 200:
-                        # Get response text first
-                        response_text = await response.text()
-                        log.info(f"API Response: {response_text}")
-                        
-                        try:
-                            # Try to parse as JSON
-                            result = json.loads(response_text)
-                        except json.JSONDecodeError:
-                            log.error(f"Failed to parse JSON response: {response_text}")
-                            return False
-                        
-                        # Check if customer found
-                        if (result and not result.get("error") and 
-                            result.get("Found") and 
-                            result.get("Cars") and 
-                            len(result["Cars"]) > 0):
-                            
-                            # Get first car data
-                            car_data = result["Cars"][0]
-                            
-                            # Populate customer_data
-                            self.customer_data["first_name"] = car_data.get("fname", "")
-                            self.customer_data["last_name"] = car_data.get("lname", "")
-                            self.customer_data["car_model"] = car_data.get("model", "")
-                            self.customer_data["car_make"] = car_data.get("make", "")
-                            self.customer_data["car_year"] = car_data.get("year", "")
-                            self.customer_data["phone"] = phone_10_digits
-                            log.info(f"Customer found: {self.customer_data['first_name']} {self.customer_data['last_name']} with {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}")
-                            return True
-                        else:
-                            log.info(f"Customer not found for phone: {phone_10_digits}")
-                            return False
-                    else:
-                        log.error(f"API call failed with status {response.status}")
-                        return False
-                        
-        except Exception as error:
-            log.error(f"Customer lookup error: {error}")
-            return False
+            return json.dumps(result) 

@@ -5,12 +5,13 @@
 # exposes run_language_agent_entrypoint(ctx, lang)
 
 from __future__ import annotations  # optional, but nice to have in 3.11+
-from dotenv import load_dotenv
 from livekit import api
 from livekit.agents import JobContext, AgentSession
 from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
 from datetime import datetime, timedelta
 import json, logging, aiohttp, re, os
+from dotenv import load_dotenv
+from pathlib import Path
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .agent_base import AutomotiveBookingAssistant
@@ -19,21 +20,28 @@ log = logging.getLogger("agent_common")
 load_dotenv(".env")
   
 VOICE_BY_LANG = { 
-    "en" :   "aEO01A4wXwd1O8GPgGlF", #Arabella
-    "fr" :   "aEO01A4wXwd1O8GPgGlF", #Arabella
-    "es" :   "aEO01A4wXwd1O8GPgGlF", #Arabella
-    "vi" :   "aEO01A4wXwd1O8GPgGlF", #Arabella
-    "hi" :   "aEO01A4wXwd1O8GPgGlF", #Arabella
-#    "en":    "zmcVlqmyk3Jpn5AVYcAL",
+    "en" :   "zmcVlqmyk3Jpn5AVYcAL", #Arabella
+    "fr" :   "zmcVlqmyk3Jpn5AVYcAL", #Arabella
+    "es" :   "zmcVlqmyk3Jpn5AVYcAL", #Arabella
+    "vi" :   "zmcVlqmyk3Jpn5AVYcAL", #Arabella
+    "hi" :   "zmcVlqmyk3Jpn5AVYcAL", #Arabella
+#    "en":    "zmcVlqmyk3Jpn5AVYcAL", Sapphire
 #    "es":    "jB2lPb5DhAX6l1TLkKXy",
 #    "fr":    "BewlJwjEWiFLWoXrbGMf",
 #    "hi":    "CpLFIATEbkaZdJr01erZ",
 #    "vi":    "8h6XlERYN1nW5v3TWkOQ",
 #    "zh":    "bhJUNIXWQQ94l8eI2VUf",
 #    "cn":    "bhJUNIXWQQ94l8eI2VUf",
+#    uYXf8XasLslADfZ2MB4u Hope
+#    aEO01A4wXwd1O8GPgGlF Arabeita
+#    WAhoMTNdLdMoq1j3wf3I Hope - rough no
 }
 
 
+#- If customer name and car details found: Hello {first_name}! welcome back to Woodbine Toyota. My name is Sara. I see you are calling to schedule an appointment. What service would you like for your {year} {model}?. Proceed to Step 3
+#- If car details not found: Hello {first_name}! welcome back to Woodbine Toyota. My name is Sara. I see you are calling to schedule an appointment. What is your car's year, make, and model?. Proceed to Step 2
+#- If customer name not found: Hello! You reached Woodbine Toyota Service. My name is Sara. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
+#- Hello {first_name}, I see you have an appointment coming up on {appointment_date} at {appointment_time}. Would you like to reschedule your appointment, or could I help you with something else?
 
 COMMON_PROMPT = """You are a booking assistant. Help customers book appointments.
 
@@ -56,9 +64,6 @@ COMMON_PROMPT = """You are a booking assistant. Help customers book appointments
 ## Follow this conversation flow:
 
 Step 1. Gather First and Last Name
-- If customer name and car details found: Hello {first_name}! welcome back to Woodbine Toyota. My name is Sara. I see you are calling to schedule an appointment. What service would you like for your {year} {model}?. Proceed to Step 3
-- If car details not found: Hello {first_name}! welcome back to Woodbine Toyota. My name is Sara. I see you are calling to schedule an appointment. What is your car's year, make, and model?. Proceed to Step 2
-- If customer name not found: Hello! You reached Woodbine Toyota Service. My name is Sara. I'll be glad to help with your appointment. Who do I have the pleasure of speaking with?
 
 Step 2. Gather vehicle year make and model
 - If first name or last name not captured: What is the spelling of your first name / last name?
@@ -81,7 +86,7 @@ Step 4. Gather transportation
 - Must go to Step 5 before Step 6
 
 Step 5. Gather mileage
-- call check_available_slots tool
+- call check_available_slots
 - Once transportation captured, Ask what is the mileage
 - Wait for mileage
     - If user does not know mileage, set mileage to 0
@@ -103,6 +108,35 @@ Else:
     On book:
         Thank the user and Inform they will receive an email or text confirmation shortly. Have a great day and we will see you soon
         call create_appointment, after that, say goodbye and the call will automatically end.
+"""
+
+
+FOUND_APPT_PROMPT = """You are a booking assistant. Help customers book appointments.
+
+## CUSTOMER LOOKUP:
+- At the beginning of the conversation, call lookup_customer (We already have customer phone number): returns customer name, car details, or booking details.
+- next, call check_available_slots
+
+## Follow this conversation flow:
+Step 1. Reschedule or Cancel
+- Ask user if they want to reschedule or cancel the appointment:
+    If reschedule:
+        Ask what is preferred date and time to reschedule to
+        If user provides a period, ask for a date and time
+        Once date and time captured:
+        If found availability, reschedule it
+        Else:
+            Offer 3 available times and repeat till user finds availability.
+                If availability is found, confirm with: Just to be sure, you would like to reschedule ...
+        On reschedule:
+            Thank the user and Inform they will receive an email or text confirmation shortly. Have a great day and we will see you soon
+            call reschedule_appointment, after that, say goodbye and the call will automatically end.
+    If cancel:
+        Call cancel_appointment
+        Thank the user and Inform they will receive an email or text confirmation shortly. Have a great day and we will see you soon
+    Else:
+        call transfer_call
+
 """
 
 
@@ -160,6 +194,72 @@ def extract_phone_from_room_name(room_name: str) -> str:
     pattern = r'call-_(\d+)_'
     match = re.search(pattern, room_name)
     return match.group(1) if match else ""
+
+
+async def lookup_customer_by_phone(phone: str, *, cars_url: str | None = None):
+    """
+    Returns: (found_cust: bool, found_appt: bool, seed: dict)
+      seed has keys suitable to prefill agent.customer_data
+    """
+    phone10 = _last10(phone)
+    if not phone10:
+        log.error(f"lookup: invalid phone: {phone!r}")
+        return (False, False, {})
+
+    url = cars_url or os.getenv("CARS_URL")
+    if not url:
+        log.warning("lookup: CARS_URL not set; skipping lookup")
+        return (False, False, {})
+
+    params = {"phone": phone10}
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(url, params=params) as resp:
+                if resp.status != 200:
+                    log.error(f"lookup: HTTP {resp.status}")
+                    return (False, False, {})
+                text = await resp.text()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            log.error("lookup: bad JSON")
+            return (False, False, {})
+
+        cars = (data or {}).get("Cars") or []
+        found_cust = bool(data) and not data.get("error") and bool(data.get("Found")) and len(cars) > 0
+        if not found_cust:
+            return (False, False, {})
+
+        car = cars[0] or {}
+        seed = {
+            "phone":            phone10,
+            "first_name":       car.get("fname", "") or "",
+            "last_name":        car.get("lname", "") or "",
+            "car_model":        car.get("model", "") or "",
+            "car_make":         car.get("make", "") or "",
+            "car_year":         car.get("year", "") or "",
+            "appointment_id":   car.get("appointment_id"),
+            "appointment_date": car.get("appointment_date", "") or "",
+            "appointment_time": car.get("appointment_time", "") or "",
+            ###TEST found_appt##
+            #"appointment_id":   "1111",
+            #"appointment_date": "09-09-2025",
+            #"appointment_time": "11:00",
+        }
+
+        appt_raw = seed["appointment_id"]
+        appt_num = int(appt_raw) if isinstance(appt_raw, str) and appt_raw.isdigit() else (appt_raw if isinstance(appt_raw, int) else None)
+        found_appt = bool(appt_num and appt_num > 0) or bool(seed["appointment_date"] and seed["appointment_time"])
+        ###TEST found_appt##
+        #found_appt = True
+        return (True, found_appt, seed)
+
+    except aiohttp.ClientError as e:
+        log.error(f"lookup: http error {e}")
+        return (False, False, {})
+    except Exception as e:
+        log.error(f"lookup: unexpected {e}", exc_info=True)
+        return (False, False, {})    
 
 
 def normalize_lang(label: str) -> str:
@@ -306,3 +406,64 @@ def register_transcript_writer(ctx, session, agent, *,
             logger.error(f"Failed to write transcript: {e}")
 
     ctx.add_shutdown_callback(write_transcript)
+
+
+def _last10(phone: str) -> str | None:
+    digits = ''.join(filter(str.isdigit, phone or ""))
+    return digits[-10:] if len(digits) >= 10 else None
+
+
+def _lookup_cache_paths(phone10: str):
+    base = f"/tmp/lookup.{phone10}"
+    return Path(base + ".lock"), Path(base + ".json")
+
+
+async def lookup_customer_singleflight(phone_number: str):
+    phone10 = _last10(phone_number)
+    if not phone10:
+        return (False, False, {})
+
+    lock_path, cache_path = _lookup_cache_paths(phone10)
+
+    # If someone already cached a result, use it
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text())
+            return data["found_cust"], data["found_appt"], data["seed"]
+        except Exception:
+            pass
+
+    # Try to become the lookup owner
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        i_am_owner = True
+    except FileExistsError:
+        i_am_owner = False
+
+    if i_am_owner:
+        # Do the real lookup once
+        found_cust, found_appt, seed = await lookup_customer_by_phone(phone_number)
+        try:
+            cache_path.write_text(json.dumps({
+                "found_cust": found_cust, "found_appt": found_appt, "seed": seed
+            }))
+        except Exception:
+            pass
+        try:
+            lock_path.unlink()
+        except Exception:
+            pass
+        return found_cust, found_appt, seed
+    else:
+        # Wait briefly for the owner to finish and read the cache
+        for _ in range(30):  # up to ~3s
+            await asyncio.sleep(0.1)
+            if cache_path.exists():
+                try:
+                    data = json.loads(cache_path.read_text())
+                    return data["found_cust"], data["found_appt"], data["seed"]
+                except Exception:
+                    break
+        # Fallback: perform our own lookup (rare)
+        return await lookup_customer_by_phone(phone_number)

@@ -51,6 +51,7 @@ GREETING_TEMPLATES = {
         "full":       "Hello {first}! Welcome back to Woodbine Toyota. My name is Sara. I see you’re calling to schedule an appointment. What service would you like for your {year} {model}?",
         "no_vehicle": "Hello {first}! Welcome back to Woodbine Toyota. My name is Sara. I see you’re calling to schedule an appointment. What is your car’s year, make, and model?",
         "no_name":    "Hello! You reached Woodbine Toyota Service. My name is Sara. I’ll be glad to help with your appointment. Who do I have the pleasure of speaking with?",
+        "reschedule": "Hello {first}! I see you have an appointment coming up for your vehicle. Would you like to reschedule your appointment, or could I help you with something else?",
     },
     "es": {
         "full":       "¡Hola {first}! Bienvenido de nuevo a Woodbine Toyota. Me llamo Sara. Veo que desea programar una cita. ¿Qué servicio le gustaría para su {year} {model}?",
@@ -101,9 +102,12 @@ def build_dynamic_greeting_and_next(agent, lang: str):
 
     has_name    = bool(first)
     has_vehicle = bool(year and model)
-
+    has_existing_appointment = bool(agent.customer_data.get("has_existing_appointment"))
     tmpl = GREETING_TEMPLATES.get(lang, GREETING_TEMPLATES["en"])
-    if has_name and has_vehicle:
+    if has_existing_appointment:
+        text = tmpl["reschedule"].format(first=first)
+        next_state = "ask reschedule or cancel"
+    elif has_name and has_vehicle:
         text = tmpl["full"].format(first=first, year=year, make=make, model=model)
         next_state = "get service"   # you already use this state name
     elif has_name and not has_vehicle:
@@ -268,7 +272,7 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVCTelephony(),
-            close_on_disconnect=False
+            close_on_disconnect=True
         ),
     )
 

@@ -116,7 +116,8 @@ class AutomotiveBookingAssistant(Agent):
         # API URLs
         self.CHECK_URL = "https://api.example.com/check"  # Replace with your actual API URL
         self.CARS_URL = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/get"    # Replace with your actual API URL
-        
+        self.CANCEL_URL = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/get"
+        self.RESCHEDULE_URL = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/get"
         # Flag to track if appointment was created
         self.appointment_created = False
 
@@ -253,10 +254,9 @@ class AutomotiveBookingAssistant(Agent):
 
 
     async def _get_lk(self) -> api.LiveKitAPI:
-        if self._lk is None:
-            # Reads LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET from env
-            self._lk = api.LiveKitAPI(session=http_session())
-        return self._lk
+        """Return the LiveKitAPI from current job context."""
+        ctx = get_job_context()
+        return ctx.api if ctx else None
 
     
     async def delayed_timeout_start(self, audio_duration):
@@ -434,29 +434,78 @@ class AutomotiveBookingAssistant(Agent):
             frame_size = 960  # 20ms @ 48kHz
             bytes_per_sample = 2
             chunk_size = frame_size * bytes_per_sample
+            buffer = b""  # Buffer to accumulate audio data
+            
             try:
                 while True:
-                    data = await process.stdout.read(chunk_size)
-                    if not data:
+                    # Read smaller chunks to avoid blocking
+                    chunk = await process.stdout.read(1024)
+                    if not chunk:
                         break
-                    frame = rtc.AudioFrame(
-                        data=data,
-                        sample_rate=48000,
-                        num_channels=1,
-                        samples_per_channel=frame_size,
-                    )
-                    await source.capture_frame(frame)
-                    await asyncio.sleep(0.02)
+                    
+                    buffer += chunk
+                    
+                    # Process complete frames from buffer
+                    while len(buffer) >= chunk_size:
+                        frame_data = buffer[:chunk_size]
+                        buffer = buffer[chunk_size:]
+                        
+                        frame = rtc.AudioFrame(
+                            data=frame_data,
+                            sample_rate=48000,
+                            num_channels=1,
+                            samples_per_channel=frame_size,
+                        )
+                        await source.capture_frame(frame)
+                        await asyncio.sleep(0.02)
+                        
             except asyncio.CancelledError:
                 # graceful exit if we cancel the task
                 pass
+            except Exception as e:
+                log.error(f"Error in read_audio: {e}")
+                raise
 
         task = asyncio.create_task(read_audio())
 
         # store handles so we can stop later (e.g., in transfer_call)
-        self._background_state.update(
-            {"process": process, "task": task, "track": track, "source": source}
-        )
+        self._background_state = {
+            "process": process, 
+            "task": task, 
+            "track": track, 
+            "source": source
+        }
+
+    async def stop_background(self):
+        """Stop background audio playback and cleanup resources."""
+        if hasattr(self, '_background_state') and self._background_state:
+            try:
+                # Cancel the audio reading task
+                if 'task' in self._background_state:
+                    self._background_state['task'].cancel()
+                    try:
+                        await self._background_state['task']
+                    except asyncio.CancelledError:
+                        pass
+                
+                # Stop the audio track
+                if 'track' in self._background_state:
+                    await self._background_state['track'].stop()
+                
+                # Terminate ffmpeg process
+                if 'process' in self._background_state:
+                    self._background_state['process'].terminate()
+                    try:
+                        await self._background_state['process'].wait()
+                    except asyncio.TimeoutError:
+                        self._background_state['process'].kill()
+                
+                log.info("Background audio stopped and cleaned up")
+                
+            except Exception as e:
+                log.error(f"Error stopping background audio: {e}")
+            finally:
+                self._background_state = {}
 
     
     # Add hangup_call function according to LiveKit documentation
@@ -465,6 +514,9 @@ class AutomotiveBookingAssistant(Agent):
         Disconnect the PSTN/SIP caller. Prefer removing the SIP participant;
         fall back to deleting the room (which disconnects everyone).
         """
+        # Stop background audio if playing
+        await self.stop_background()
+        
         self.cancel_timeout()
         ctx = get_job_context()
         if not ctx:
@@ -792,27 +844,38 @@ class AutomotiveBookingAssistant(Agent):
         log.info(f"Looking up customer in")
         
         # Check if customer data is already populated
-        if (self.customer_data["first_name"] and 
-            self.customer_data["last_name"] and 
-            self.customer_data["car_make"] and 
-            self.customer_data["car_model"] and 
-            self.customer_data["car_year"]):
-            
-            # Customer found, create response from existing customer_data
+        if (self.customer_data.get("first_name") and 
+            self.customer_data.get("last_name") and 
+            self.customer_data.get("car_make") and 
+            self.customer_data.get("car_model") and 
+            self.customer_data.get("car_year")):
+
+            # Derive existing appointment info from customer_data if present
+            has_existing = bool(self.customer_data.get("found_appt_id") and 
+                                self.customer_data.get("selected_date") and 
+                                self.customer_data.get("selected_time")) or \
+                           bool(self.customer_data.get("has_existing_appointment"))
+
             result = {
                 "success": True,
-                "firstName": self.customer_data["first_name"],
-                "lastName": self.customer_data["last_name"],
-                "make": self.customer_data["car_make"],
-                "model": self.customer_data["car_model"],
-                "year": self.customer_data["car_year"],
-                "message": f"Found customer record with name: {self.customer_data['first_name']} {self.customer_data['last_name']} with car {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}"                
+                "firstName": self.customer_data.get("first_name", ""),
+                "lastName": self.customer_data.get("last_name", ""),
+                "make": self.customer_data.get("car_make", ""),
+                "model": self.customer_data.get("car_model", ""),
+                "year": self.customer_data.get("car_year", ""),
+                "services": self.customer_data.get("services", []),
+                "transportation": self.customer_data.get("transportation", ""),
+                "hasExistingAppointment": has_existing,
+                "found_appt_id": self.customer_data.get("found_appt_id", ""),
+                "appt_date": self.customer_data.get("selected_date", ""),
+                "appt_time": self.customer_data.get("selected_time", ""),
+                "message": f"Found customer record with name: {self.customer_data.get('first_name','')} {self.customer_data.get('last_name','')} with car {self.customer_data.get('car_year','')} {self.customer_data.get('car_make','')} {self.customer_data.get('car_model','')}"
             }
-            # Store the lookup result for later use
             return json.dumps(result)
         else:
             result = {
                 "success": False,
+                "hasExistingAppointment": False,
                 "message": "Customer not found in our system. Please ask customer information."
             }
             return json.dumps(result)  
@@ -873,7 +936,38 @@ class AutomotiveBookingAssistant(Agent):
                             self.customer_data["car_make"] = car_data.get("make", "")
                             self.customer_data["car_year"] = car_data.get("year", "")
                             self.customer_data["phone"] = phone_10_digits
-                            log.info(f"Customer found: {self.customer_data['first_name']} {self.customer_data['last_name']} with {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']}")
+
+                            # Optional additional fields from response
+                            ## TODO: Remove this after testing
+                            found_appt_id = "123"
+                            appt_date = "2025-09-09"
+                            appt_time = "10:00:00"
+                            services_raw = (result.get("services") or "").strip()
+                            transportation_raw = (result.get("transportation") or "").strip()
+
+                            # Store services as list if provided
+                            if services_raw:
+                                try:
+                                    services_list = [s.strip() for s in services_raw.split(',') if s.strip()]
+                                except Exception:
+                                    services_list = [services_raw]
+                                self.customer_data["services"] = services_list
+
+                            # Store transportation (keep raw and a simple mapped flag)
+                            if transportation_raw != "":
+                                self.customer_data["transportation"] = transportation_raw
+
+                            # If there is an existing appointment, capture and pivot flow
+                            if found_appt_id and appt_date and appt_time:
+                                self.customer_data["found_appt_id"] = found_appt_id
+                                self.customer_data["selected_date"] = appt_date
+                                self.customer_data["selected_time"] = appt_time
+                                self.customer_data["has_existing_appointment"] = True
+
+                                # Switch conversation to reschedule/cancel flow (prompt is handled via COMMON_PROMPT)
+                                self._current_state = "ask reschedule or cancel"
+
+                            log.info(f"Customer found: {self.customer_data['first_name']} {self.customer_data['last_name']} with {self.customer_data['car_year']} {self.customer_data['car_make']} {self.customer_data['car_model']} and has existing appointment: {self.customer_data['has_existing_appointment']}")
                             return True
                         else:
                             log.info(f"Customer not found for phone: {phone_10_digits}")
@@ -885,3 +979,31 @@ class AutomotiveBookingAssistant(Agent):
         except Exception as error:
             log.error(f"Customer lookup error: {error}")
             return False
+
+    @function_tool
+    async def cancel_appointment(self, context: RunContext, appointment_id: str) -> str:
+        """Cancel an existing appointment."""
+        try:
+            payload = {"appointment_id": appointment_id}
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.CANCEL_URL, json=payload) as resp:
+                    self.customer_data["has_existing_appointment"] = False
+                    return "Appointment cancelled successfully."
+        except Exception as e:
+            log.error(f"cancel_appointment error: {e}")
+            return "Failed to cancel appointment."
+
+    @function_tool
+    async def reschedule_appointment(self, context: RunContext, appointment_id: str, new_date: str, new_time: str) -> str:
+        """Reschedule an existing appointment to a new date and time."""
+        try:
+            payload = {"appointment_id": appointment_id, "date": new_date, "time": new_time}
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.RESCHEDULE_URL, json=payload) as resp:
+                    self.customer_data["selected_date"] = new_date
+                    self.customer_data["selected_time"] = new_time
+                    return "Appointment rescheduled successfully."
+    
+        except Exception as e:
+            log.error(f"reschedule_appointment error: {e}")
+            return "Failed to reschedule appointment."

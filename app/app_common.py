@@ -7,10 +7,10 @@
 from __future__ import annotations  # optional, but nice to have in 3.11+
 from dotenv import load_dotenv
 from livekit import api
-from livekit.agents import JobContext, AgentSession
+from livekit.agents import JobContext, AgentSession, JobProcess
 from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
 from datetime import datetime, timedelta
-import json, logging, aiohttp, re, os
+import json, logging, aiohttp, re, os, asyncio
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .agent_base import AutomotiveBookingAssistant
@@ -45,9 +45,9 @@ COMMON_PROMPT = """You are a booking assistant. Help customers book appointments
 - After collecting services and transportation: call save_services_detail
 - After booking: call create_appointment
 - Do not say things like "Let me save your information" or "Please wait." Just proceed silently to next step
-- For recall, reschedule appointment or cancel appointment: call transfer_call
+- For recall: call transfer_call
 - For speak with someone, customer service, or user is frustrated: call transfer_call
-
+- If customer has an existing appointment, pivot to reschedule/cancel flow
 - For address: 80 Queens Plate Dr, Etobicoke
 - For price: oil change starts at $130 plus tax
 - For Wait time: 45 minutes to 1 hour
@@ -103,6 +103,22 @@ Else:
     On book:
         Thank the user and Inform they will receive an email or text confirmation shortly. Have a great day and we will see you soon
         call create_appointment, after that, say goodbye and the call will automatically end.
+
+## ADD-ON: Existing appointment reschedule/cancel flow (do not change above)
+- Enter this flow only if found_appt_id and appt_date and appt_time are present from lookup (customer has an existing appointment).
+
+Step 1. Ask customer reschedule or cancel appointment
+- Hello {first_name}, I see you have an appointment coming up for your vehicle. Would you like to reschedule your appointment, or could I help you with something else?
+
+Step 2.A. If customer wants to reschedule
+- Trigger function check_available_slots to get available timeslots
+- Offer customer available timeslots
+- If date and time are selected, confirm: "Please say YES to reschedule your appointment"
+- After YES, trigger function "reschedule_appointment" and say "Great. I have rescheduled your appointment. Good bye"
+
+Step 2.B. If customer wants to cancel
+- Ask customer confirm: "Please say cancel again"
+- If customer confirmed then trigger function cancel_appointment and say "Great. I have cancelled your appointment. Good bye"
 """
 
 
@@ -298,11 +314,11 @@ def register_transcript_writer(ctx, session, agent, *,
                         if resp.status == 200:
                             log.info(f"History sent OK: {await resp.json()}")
                         else:
-                            logger.error(f"History send failed: {resp.status} {await resp.text()}")
+                            log.error(f"History send failed: {resp.status} {await resp.text()}")
             except Exception as api_err:
-                logger.error(f"Error sending to API: {api_err}")
+                log.error(f"Error sending to API: {api_err}")
 
         except Exception as e:
-            logger.error(f"Failed to write transcript: {e}")
+            log.error(f"Failed to write transcript: {e}")
 
     ctx.add_shutdown_callback(write_transcript)

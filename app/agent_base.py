@@ -1,5 +1,10 @@
+#TO BE CHANGED
+#   findCustomer: If find appointment
+#   reschedule_appointment
+#   cancel_appointment
+
 # your AutomotiveBookingAssistant base class/logic
-from .app_common import LANG_TO_DG, VOICE_BY_LANG, CONFIRM_BY_LANG, normalize_lang
+from .app_common import CONFIRM_BY_LANG, normalize_lang
 from .agent_supervisor import LanguageSupervisor
 from livekit import agents, rtc, api, agents
 from livekit.agents.metrics import TTSMetrics
@@ -21,17 +26,6 @@ from dotenv import load_dotenv
 
 log = logging.getLogger("agent")
 load_dotenv(".env")
-
-LANG_SYNONYMS = {
-    "fr": ["french","francais","français","fr", "fransay","fransais","frances","en français","parlez français"],
-    "es": ["spanish","espanol","español","es","en español","habla español","puedes hablar español"],
-    "hi": ["hindi","hi","हिंदी"],
-    "vi": ["vietnamese","viet","vi","tiếng việt","tieng viet"],
-    "en-US": ["english","en","inglés","anglais"],
-    "en": ["english","en","inglés","anglais"],
-    # Chinese (Mandarin). Avoid non-standard 'cn' but accept it as alias.
-    "zh": ["chinese", "mandarin", "zh", "zh-cn", "中文", "普通话", "国语", "cn"],
-}
 
 
 class AutomotiveBookingAssistant(Agent):
@@ -60,6 +54,8 @@ class AutomotiveBookingAssistant(Agent):
         self._is_shutting_down         = False
         self._timeouts                 = 0
         self.supervisor                = supervisor or lang_switch_q
+        self._background_state         = {"task": None, "source": None}
+        self._found_appt_id            = 0            #If appointment is found
         self.customer_data = {
             "first_name": "",
             "last_name": "",
@@ -73,7 +69,8 @@ class AutomotiveBookingAssistant(Agent):
             "selected_date": None,
             "selected_time": None,
             "services_transcript": "",
-            "is_maintenance": 0
+            "is_maintenance": 0,
+            "appointment_id": 0
         }        
         self.service_mapping = {
             "oil change": "2OILCHANGE",
@@ -113,11 +110,6 @@ class AutomotiveBookingAssistant(Agent):
         # Generate available time slots for next 2 weeks
         self.available_slots = self._generate_available_slots()
         
-        # API URLs
-        self.CHECK_URL = "https://api.example.com/check"  # Replace with your actual API URL
-        self.CARS_URL = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/get"    # Replace with your actual API URL
-        self.CANCEL_URL = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/get"
-        self.RESCHEDULE_URL = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/get"
         # Flag to track if appointment was created
         self.appointment_created = False
 
@@ -157,6 +149,9 @@ class AutomotiveBookingAssistant(Agent):
             "selected_time":        self._safe_copy(self._safe_get(s, "selected_time")),
             "services_transcript":  self._safe_copy(self._safe_get(s, "services_transcript")),
             "is_maintenance":       self._safe_copy(self._safe_get(s, "is_maintenance")),
+            "appointment_id":       self._safe_copy(self._safe_get(s, "appointment_id")),
+            "appointment_date":     self._safe_copy(self._safe_get(s, "appointment_date")),
+            "appointment_time":     self._safe_copy(self._safe_get(s, "appointment_time")),
         }
         return snap
 
@@ -355,19 +350,24 @@ class AutomotiveBookingAssistant(Agent):
             await self._session_ref.say(reprompt)
 
         elif self._current_state == "get transportation":
-            reprompt = (f"Are you still there {first_name}? Would you like to drop off your vehicle "
+            reprompt = (f"Are you still there {first_name}? Would you like to drop off your vehicle"
                         "or wait at the dealership?")
             self._current_state = "first availability"
             await self._session_ref.say(reprompt)
 
         elif self._current_state == "first availability":
             # For availability, you wanted LLM to “repeat availability”
-            reprompt = "Ask if user is still there. Repeat availability."
+            reprompt = "Ask if user is still there. Repeat availability"
             self._current_state = "check availability"
             await self._session_ref.generate_reply(instructions=reprompt)
 
         elif self._current_state == "check availability":
-            reprompt = "Ask if user is still there. Repeat availability."
+            reprompt = "Ask if user is still there. Repeat availability"
+            # stay in "check availability"
+            await self._session_ref.generate_reply(instructions=reprompt)
+
+        elif self._current_state == "cancel reschedule":
+            reprompt = "Ask if user would like to reschedule"
             # stay in "check availability"
             await self._session_ref.generate_reply(instructions=reprompt)
 
@@ -635,7 +635,8 @@ class AutomotiveBookingAssistant(Agent):
         if canon == getattr(self, "lang", "en"):
             return "OK"
 
-        await self.say(f"Please wait while I get you my {lang} colleague …")
+        #await self.say(f "Please wait while I get you my {lang} colleague …")
+        await self.say(CONFIRM_BY_LANG[lang])
 
         self._handoff_inflight = True
         self._is_shutting_down = True
@@ -832,6 +833,73 @@ class AutomotiveBookingAssistant(Agent):
         self.appointment_created = True
         
         return f"Appointment confirmed! Your appointment ID is {appointment_id}. You have service scheduled for {selected_date} at {selected_time}. We'll send a confirmation message shortly. Have a great day!"
+
+
+    #TO BE CHANGED
+    @function_tool
+    async def reschedule_appointment(self, context: RunContext, appointment_id: str, first_name: str, last_name: str,
+                               car_make: str, car_model: str, car_year: str, services: List[str],
+                               transportation: str, services_transcript: str, is_maintenance: int,
+                               selected_date: str, selected_time: str) -> str:
+        """reschedule an booking appointment.
+        
+        Args:
+            appointment_id
+            first_name: Customer's first name
+            last_name: Customer's last name
+            car_make: Car make
+            car_model: Car model
+            car_year: Car year
+            services: List of services requested
+            transportation: Drop off or wait
+            services_transcript: Transcript of the request for services
+            is_maintenance: Whether this is a maintenance service (0 or 1)
+            selected_date: Selected appointment date in YYYY-MM-DD format
+            selected_time: Selected appointment time in HH:mm:ss format
+        """
+        log.info(f"Rescheduling appointment for {first_name} {last_name} on {selected_date} at {selected_time}")
+        
+
+        # Remove the slot from available slots
+        # self.available_slots[selected_date].remove(selected_time)
+        
+        # Store appointment details
+        appointment_data = {
+            "appointment_id": appointment_id,
+            "customer_name": f"{first_name} {last_name}",
+            "car_info": f"{car_year} {car_make} {car_model}",
+            "services": services,
+            "services_transcript": services_transcript,
+            "transportation": transportation,
+            "is_maintenance": is_maintenance,
+            "date": selected_date,
+            "time": selected_time,
+            "status": "confirmed",
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # In a real implementation, you would save this to a database
+        log.info(f"Appointment created: {json.dumps(appointment_data)}")
+        
+        # Set flag to indicate appointment was created - this will trigger hangup after goodbye
+        self.appointment_created = True
+        
+        # Set flag to indicate appointment was created - this will trigger hangup after goodbye
+        self.appointment_created = True
+        
+        return f"Appointment rescheduled! Your service is rescheduled for {selected_date} at {selected_time}. We'll send a confirmation message shortly. Have a great day!"
+
+
+    #TO BE CHANGED
+    @function_tool
+    async def cancel_appointment(self, context: RunContext, appointment_id: str) -> str:
+        """cancel appointment.
+        
+        Args:
+            appointment_id
+        """
+        log.info(f"cancel_appointment for {first_name} {last_name} on {selected_date} at {selected_time}")        
+        return f"Appointment cancelled! We'll send a confirmation message shortly. Have a great day!"
 
 
     @function_tool(name="lookup_customer", description="Look up customer by phone number already on file.")

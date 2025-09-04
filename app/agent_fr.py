@@ -1,55 +1,46 @@
-import logging, os
-from .agent_supervisor import LanguageSupervisor, OneShotSupervisor
-from .agent_base import AutomotiveBookingAssistant
-from .agent_common import run_language_agent_entrypoint, prewarm
-from livekit.agents import JobContext, WorkerOptions, cli
+# app/agent_fr.py
+import os, sys, logging
 
-# --- logging: make sure prints/logs show up immediately ---
+# Make stdout unbuffered so child logs show up immediately.
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
-if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s %(name)s - %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
 
+from livekit.agents import WorkerOptions, JobContext         # <-- correct imports
+from livekit.agents.cli import cli                           # <-- cli comes from .cli
+from .agent_common import run_language_agent_entrypoint       # <-- async function
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s %(name)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 log = logging.getLogger("agent_fr")
 
-async def entrypoint(ctx):
+async def entrypoint(ctx: JobContext):
     """
-    French agent entrypoint:
-      - Ensures HANDOFF_ROOM/HANDOFF_LANG are set (for supervisor handoff)
-      - Logs the resolved env clearly
-      - Delegates to run_language_agent_entrypoint(ctx, "fr")
-        which MUST: join the room, then touch /tmp/{HANDOFF_ROOM}-READY-fr, then greet.
+    The ONLY entrypoint for the FR worker. Must be async and awaited by the runtime.
     """
     log.info("***********FRENCH AGENT***************")
 
-    # Ensure the child knows the room even if spawned without CLI args
-    room_name = None
-    if getattr(ctx, "room", None) and getattr(ctx.room, "name", None):
-        room_name = ctx.room.name
+    # Ensure HANDOFF_* are present for supervisor handoff path.
+    room_name = getattr(getattr(ctx, "room", None), "name", None)
     env_room = os.environ.get("HANDOFF_ROOM") or room_name or "unknown_room"
     os.environ["HANDOFF_ROOM"] = env_room
-
-    # Mark this process as the FR handoff child (lets the child bypass singleflight)
     os.environ.setdefault("HANDOFF_LANG", "fr")
 
-    log.info(f"[fr] entrypoint starting: HANDOFF_ROOM={os.environ.get('HANDOFF_ROOM')} "
-             f"HANDOFF_LANG={os.environ.get('HANDOFF_LANG')}")
+    log.info(
+        "[fr] entrypoint starting: HANDOFF_ROOM=%s HANDOFF_LANG=%s",
+        os.environ.get("HANDOFF_ROOM"),
+        os.environ.get("HANDOFF_LANG"),
+    )
 
-    try:
-        # Delegate to the shared boot logic (it will:
-        #  - normalize 'fr'
-        #  - build STT/TTs for FR
-        #  - session.start(...)
-        #  - write READY file: /tmp/{HANDOFF_ROOM}-READY-fr
-        #  - greet in French
-        await run_language_agent_entrypoint(ctx, "fr")
-    except Exception as e:
-        # Make any startup failure VERY visible
-        log.exception("[fr] fatal error in entrypoint: %s", e)
-        raise
+    # IMPORTANT: await the shared runner (it's async)
+    await run_language_agent_entrypoint(ctx, "fr")
+
+# Keep this file minimal: do NOT import or define any `prewarm` here unless you really need it.
+# If you DO need a prewarm, it must be a SYNC function:  def prewarm(proc): ...
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=None))
+    # Pass ONLY the entrypoint; omit prewarm entirely unless required/supported by your SDK version.
+    # Passing prewarm_fnc=None can trip some versions; just omit it.
+    assert callable(entrypoint), "entrypoint is not callable"
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

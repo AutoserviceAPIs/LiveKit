@@ -30,13 +30,20 @@ import logging, aiohttp, json, os, asyncio, re, time, math
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 from collections import defaultdict
 
 log = logging.getLogger("agent_common")
 
 LLM_MODEL = "gpt-4o-mini"
+
+#Step 5. Gather mileage
+#- Once transportation captured, Ask what is the mileage
+#- call check_available_slots to get available dates
+#- Wait for mileage
+#    - If user does not know mileage, set mileage to 0
+#Proceed to Step 6
 
 #Step 6. Offer first availability
 #Step6: - After services, transportation captured: Thank user, offer the first availability and ask if that will work, or if the user has a specific time
@@ -52,6 +59,11 @@ COMMON_PROMPT = f"""You are a booking assistant. Help customers book appointment
 ## CURRENT DATE INFORMATION:
 - Today's date is: {current_date} ({current_date_readable})
 - Use this information when customers ask about "today", "tomorrow", or specific dates
+- if morning use time-7 AM
+- if afternoon use time=2 PM
+- if evening use time=5 PM
+- If date not provided: use today's date
+- If time not provided: use time=7 AM
 
 ## CUSTOMER LOOKUP:
 - At the beginning of the conversation, call lookup_customer (We already have customer phone number): returns customer name, car details, or booking details.
@@ -60,6 +72,7 @@ COMMON_PROMPT = f"""You are a booking assistant. Help customers book appointment
 - After collecting car year make and model: call save_customer_information
 - After collecting services and transportation: call validate_and_save_services (MANDATORY - must be called immediately after getting transportation)
 - After collecting mileage: call check_available_slots
+- After collecting date and time: call check_available_slots
 - After booking: call create_appointment
 - Do not say things like "Let me save your information" or "Please wait." Just proceed silently to next step
 - For recall: {INSTRUCTIONS_RECALL}
@@ -76,9 +89,9 @@ COMMON_PROMPT = f"""You are a booking assistant. Help customers book appointment
 ## Follow this conversation flow:
 
 Step 1. Gather First and Last Name
+- If first name or last name not captured: What is the spelling of your first name / last name?
 
 Step 2. Gather vehicle year make and model
-- If first name or last name not captured: What is the spelling of your first name / last name?
 - Once both first name and last name captured, Ask for the vehicle's year make and model? for example, 2025 Toyota Camry
 - call save_customer_information
 
@@ -93,24 +106,21 @@ Step 3. Gather services
   - After capture services, go to step 4
 
 Step 4. Gather transportation
-- After capture services, Ask if will be dropping off the vehicle or waiting while we do the work
+- After capture services, Ask if will be dropping off the vehicle or waiting while we do the work for <services>
 - Wait for transportation
-- IMMEDIATELY after getting transportation, call validate_and_save_services tool with services and transportation
+- IMMEDIATELY after getting transportation, call validate_and_save_services with services and transportation
 - Must go to Step 5 before Step 6
 
-Step 5. Gather mileage
-- Once transportation captured, Ask what is the mileage
-- Wait for mileage
-    - If user does not know mileage, set mileage to 0
-- call check_available_slots to get available dates
-Proceed to Step 6
+Step 5. Ask date and time
+- After transportation captured: Thank user, ask if they have a preferred date or time
+- Wait for date or time
 
 Step 6. Find availability
-- After services, transportation captured: Thank user, ask if they have a preferred date or time for the requested services
-    If user provides a period, ask for a date and time
-    Once date and time captured:
+- call check_available_slots to get available dates 
+- Offer 3 available times and repeat till user finds availability:
     If found availability, book it
     Else:
+        call check_available_slots to get available dates 
         Offer 3 available times and repeat till user finds availability.
             If availability is found, confirm with: Just to be sure, you would like to book ...
     On book:
@@ -419,6 +429,19 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
             except Exception as e:
                 log.warning(f"[{lang}] lookup failed: {e}")
 
+        # --------- robust VAD resolution (safe if missing) ----------
+        vad_obj = None
+        try:
+            vad_obj = (getattr(getattr(ctx, "proc", None), "userdata", {}) or {}).get("vad")
+            if not vad_obj:
+                vad_obj = getattr(ctx, "userdata", {}).get("vad")
+        except Exception:
+            vad_obj = None
+        if vad_obj:
+            log.info(f"[{lang}] using provided VAD: {type(vad_obj).__name__}")
+        else:
+            log.info(f"[{lang}] no VAD provided; continuing without explicit VAD")
+
         # Build session
         session = AgentSession(
             llm=openai.LLM(model=LLM_MODEL),
@@ -434,9 +457,171 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
                 ),
             ),
             turn_detection=MultilingualModel(),
-            vad=ctx.proc.userdata["vad"],
+            vad=vad_obj,  # may be None
             preemptive_generation=False,
         )
+
+        install_speech_sanitizer(session)
+
+        # --------- TTS sanitizer (times + "o’clock") installed globally ----------
+        def _format_time_for_tts(text: str) -> str:
+            """
+            Normalize & remap times for TTS:
+              - AM mapping:   12 -> 11, else hour -> hour + 1   (e.g., 7:00 AM -> 8 AM, 12:00 AM -> 11 AM)
+              - PM mapping:   12 -> 12, else hour -> hour - 1   (e.g., 1:00 PM -> 12 PM, 12:00 PM -> 12 PM)
+              - Remove 'o'clock' (including unicode apostrophes)
+              - Collapse :00 minutes (keep non-zero minutes)
+              - Normalize AM/PM variants (A.M., a.m., etc.)
+              - Canonicalize 08 AM -> 8 AM
+
+            Examples:
+              "7:00 AM"        -> "8 AM"
+              "12:00 AM"       -> "11 AM"
+              "10:15 AM"       -> "11:15 AM"
+              "1:00 PM"        -> "12 PM"
+              "12:00 PM"       -> "12 PM"
+              "8 o’clock a.m." -> "9 AM"  (AM rule: +1 hour, 8 -> 9)
+            """
+            if not isinstance(text, str):
+                return text
+
+            # --- Patterns ---
+            AM_VARIANT = re.compile(r"\bA\s*\.?\s*M\.?\b", re.IGNORECASE)
+            PM_VARIANT = re.compile(r"\bP\s*\.?\s*M\.?\b", re.IGNORECASE)
+            AM_DOTTED  = re.compile(r"\b(AM|PM)\.", re.IGNORECASE)
+
+            # e.g. "8 o'clock AM", "8 o’clock am", "8 o ’ clock PM"
+            O_CLOCK    = re.compile(r"\b(\d{1,2})\s*o[’']?\s*clock\s*(AM|PM)\b", re.IGNORECASE)
+
+            # e.g. "7:00 AM", "10:15 pm"
+            TIME_AMPM  = re.compile(r"\b(\d{1,2}):(\d{2})\s*(AM|PM)\b", re.IGNORECASE)
+
+            # e.g. "08 AM", "8AM"
+            HOUR_AMPM  = re.compile(r"\b0?(\d{1,2})\s*(AM|PM)\b", re.IGNORECASE)
+
+            # --- Helpers ---
+            def _remap_hour(hour: int, ampm: str, minute: str | None) -> str:
+                """Apply your mapping and format, dropping :00 minutes."""
+                ampm_u = ampm.upper()
+                h = hour
+
+                if ampm_u == "AM":
+                    if h == 12:
+                        h = 11
+                    else:
+                        h = h + 1
+                        if h == 13:
+                            h = 1
+                else:  # PM
+                    if h == 12:
+                        h = 12
+                    else:
+                        h = h - 1
+                        if h == 0:
+                            h = 12
+
+                if minute is None or minute == "00":
+                    return f"{h} {ampm_u}"
+                return f"{h}:{minute} {ampm_u}"
+
+            # --- 1) Normalize AM/PM variants ---
+            text = AM_VARIANT.sub("AM", text)
+            text = PM_VARIANT.sub("PM", text)
+            text = AM_DOTTED.sub(lambda m: m.group(1).upper(), text)
+
+            # --- 2) Handle "o'clock" hour-only cases first (they have no minutes) ---
+            def _fix_oclock(m: re.Match) -> str:
+                hour = int(m.group(1))
+                ampm = m.group(2)
+                return _remap_hour(hour, ampm, minute=None)
+            text = O_CLOCK.sub(_fix_oclock, text)
+
+            # --- 3) Handle hh:mm AM/PM (drop :00 after mapping; keep non-zero minutes) ---
+            def _fix_hhmm(m: re.Match) -> str:
+                hour = int(m.group(1))
+                minute = m.group(2)
+                ampm = m.group(3)
+                return _remap_hour(hour, ampm, minute)
+            text = TIME_AMPM.sub(_fix_hhmm, text)
+
+            # --- 4) Handle bare hour + AM/PM (08 AM, 8AM) last, so we don't double-convert ---
+            def _fix_hour(m: re.Match) -> str:
+                hour = int(m.group(1))
+                ampm = m.group(2)
+                return _remap_hour(hour, ampm, minute=None)
+            text = HOUR_AMPM.sub(_fix_hour, text)
+
+            # --- 5) Tidy spaces ---
+            text = re.sub(r"[ \t]{2,}", " ", text).strip()
+            return text
+
+
+        def _install_tts_sanitizer(sess):
+            if getattr(sess, "_tts_sanitizer_installed", False):
+                return
+            sess._tts_sanitizer_installed = True
+
+            def _sanitize_payload(p):
+                if isinstance(p, str):
+                    return _format_time_for_tts(p)
+                if isinstance(p, dict):
+                    if isinstance(p.get("instructions"), str):
+                        p = dict(p)
+                        p["instructions"] = _format_time_for_tts(p["instructions"])
+                    r = p.get("response")
+                    if isinstance(r, dict) and isinstance(r.get("instructions"), str):
+                        p = dict(p)
+                        rr = dict(r); rr["instructions"] = _format_time_for_tts(rr["instructions"])
+                        p["response"] = rr
+                return p
+
+            # session.update
+            if hasattr(sess, "update") and callable(sess.update):
+                _orig_update = sess.update
+                async def _patched_update(payload=None, **kw):
+                    payload = _sanitize_payload(payload)
+                    res = await _orig_update(payload, **kw)
+                    # re-wrap response.create if SDK swaps it
+                    resp_obj = getattr(sess, "response", None)
+                    if resp_obj and hasattr(resp_obj, "create") and not getattr(resp_obj, "_tts_sanitizer_wrapped", False):
+                        _wrap_response_create(sess)
+                    return res
+                sess.update = _patched_update  # type: ignore
+
+            # session.say
+            if hasattr(sess, "say") and callable(sess.say):
+                _orig_say = sess.say
+                async def _patched_say(text):
+                    return await _orig_say(_format_time_for_tts(text))
+                sess.say = _patched_say  # type: ignore
+
+            # session.generate_reply
+            if hasattr(sess, "generate_reply") and callable(sess.generate_reply):
+                _orig_gen = sess.generate_reply
+                async def _patched_gen(*args, **kw):
+                    if args and isinstance(args[0], str):
+                        args = (_format_time_for_tts(args[0]), *args[1:])
+                    if "instructions" in kw and isinstance(kw["instructions"], str):
+                        kw = dict(kw); kw["instructions"] = _format_time_for_tts(kw["instructions"])
+                    return await _orig_gen(*args, **kw)
+                sess.generate_reply = _patched_gen  # type: ignore
+
+            # response.create
+            def _wrap_response_create(s):
+                robj = getattr(s, "response", None)
+                if not robj or getattr(robj, "_tts_sanitizer_wrapped", False):
+                    return
+                _orig = robj.create
+                async def _patched_create(payload):
+                    return await _orig(_sanitize_payload(payload))
+                robj.create = _patched_create  # type: ignore
+                robj._tts_sanitizer_wrapped = True
+
+            if getattr(sess, "response", None) and hasattr(sess.response, "create"):
+                _wrap_response_create(sess)
+
+        _install_tts_sanitizer(session)
+        # --------- end sanitizer ----------
 
         # Choose prompt
         final_prompt = choose_prompt_by_flags(lang, found_cust, found_appt)
@@ -456,6 +641,7 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
         if phone_number:
             agent._sip_participant_identity = f'sip_{phone_number}'
             agent.customer_data["phone"] = phone_number
+
         # Seed state
         if seed:
             agent.customer_data.update(seed)
@@ -525,14 +711,14 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
         log.info(f"[{lang}] touching READY flag: {ready_path}")
 
         ok = False
-        for i in range(5):
+        for _ in range(5):
             try:
                 ready_path.touch(exist_ok=True)
                 if ready_path.exists():
                     ok = True
                     break
             except Exception as e:
-                log.warning(f"[{lang}] READY touch failed (attempt {i+1}): {e}")
+                log.warning(f"[{lang}] READY touch failed: {e}")
             await asyncio.sleep(0.05)
 
         if not ok:
@@ -546,9 +732,7 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
         except Exception as e:
             log.warning(f"[{lang}] ctx.connect failed or already connected: {e}")
 
-        # No child-side beeps. EN plays beeps during handoff.
-
-        # Greet
+        # Greet (times already sanitized by the global wrapper)
         greet_text, next_state = build_dynamic_greeting_and_next(agent, lang)
         if hasattr(agent, "set_current_state"):
             agent.set_current_state(next_state)
@@ -561,6 +745,7 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
     finally:
         if acquired_lock:
             _release_room_lock(room_name)
+
 
 def _attach_common_handlers(session: "AgentSession", agent, tag: str):
     @session.on("transcription")
@@ -940,3 +1125,160 @@ async def play_beeps(self, room: rtc.Room, *, count=2, freq=1000, duration=0.15,
             source.close()
 
     await _beep_task()
+
+
+def install_speech_sanitizer(session):
+    """Patch ALL outbound speech paths to normalize/shift times for TTS."""
+
+    if getattr(session, "_speech_sanitizer_installed", False):
+        return
+    session._speech_sanitizer_installed = True
+
+    # ---------- formatting logic ----------
+    AM_VARIANT = re.compile(r"\bA\s*\.?\s*M\.?\b", re.IGNORECASE)
+    PM_VARIANT = re.compile(r"\bP\s*\.?\s*M\.?\b", re.IGNORECASE)
+    O_CLOCK    = re.compile(r"\b(\d{1,2})\s*o[’']?\s*clock\s*(AM|PM)\b", re.IGNORECASE)
+    TIME_AMPM  = re.compile(r"\b(\d{1,2}):(\d{2})\s*(AM|PM)\b", re.IGNORECASE)
+    HOUR_AMPM  = re.compile(r"\b0?(\d{1,2})\s*(AM|PM)\b", re.IGNORECASE)
+
+
+    def _remap_hour(hour: int, ampm: str, minute: str | None) -> str:
+        # Your requested mapping:
+        # AM: 12 -> 11, else hour -> hour + 1
+        # PM: 12 -> 12, else hour -> hour - 1
+        ampm_u = ampm.upper()
+        h = hour
+        if ampm_u == "AM":
+            if h == 12:
+                h = 11
+            else:
+                h = h + 1
+                if h == 13:
+                    h = 1
+        else:  # PM
+            if h == 12:
+                h = 12
+            else:
+                h = h - 1
+                if h == 0:
+                    h = 12
+        if minute is None or minute == "00":
+            return f"{h} {ampm_u}"
+        return f"{h}:{minute} {ampm_u}"
+
+
+    def _format_time_for_tts(text: str) -> str:
+        """
+        Normalize times so ElevenLabs doesn't speak 'o'clock':
+          - '8:00 AM'  -> '8 AM'   (U+202F between hour and AM/PM)
+          - '9:00 PM'  -> '9 PM'
+          - '10:15 AM' -> '10:15 AM' (keeps minutes, inserts U+202F)
+          - '8 o’clock AM'/'8 o'clock am' -> '8 AM'
+          - 'A.M.'/'a.m.' → 'AM', 'P.M.'/'p.m.' → 'PM'
+        """
+        _HOUR_AMPM  = re.compile(r"\b0?(\d{1,2})\s*(AM|PM)\b", re.IGNORECASE)
+        _TIME_AMPM = re.compile(r"\b(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)\b")
+        _O_CLOCK   = re.compile(r"\b(\d{1,2})\s*o[’']?\s*clock\s*(AM|PM)\b", re.IGNORECASE)
+        _AM_VARIANT= re.compile(r"\bA\s*\.?\s*M\.?\b", re.IGNORECASE)
+        _PM_VARIANT= re.compile(r"\bP\s*\.?\s*M\.?\b", re.IGNORECASE)
+        _AM_DOTTED = re.compile(r"\b(AM|PM)\.", re.IGNORECASE)
+
+        if not isinstance(text, str):
+            return text
+
+        # 1) Normalize AM/PM variants
+        text = _AM_VARIANT.sub("AM", text)
+        text = _PM_VARIANT.sub("PM", text)
+
+        # 2) Remove explicit "o'clock/o’clock" while preserving hour + AM/PM
+        text = _O_CLOCK.sub(lambda m: f"{int(m.group(1))}\u202F{m.group(2).upper()}", text)
+
+        # 3) On-the-hour: drop :00 and insert U+202F before AM/PM
+        def _hhmm(m):
+            h, mm, ap = int(m.group(1)), m.group(2), m.group(3).upper()
+            if mm == "00":
+                return f"{h}\u202F{ap}"
+            return f"{h}:{mm}\u202F{ap}"
+        text = _TIME_AMPM.sub(_hhmm, text)
+
+        # 4) Bare hour + AM/PM (8 AM / 08AM) → insert U+202F
+        text = _HOUR_AMPM.sub(lambda m: f"{int(m.group(1))}\u202F{m.group(2).upper()}", text)
+
+        # 5) Clean regular spaces (do NOT touch U+202F)
+        text = re.sub(r"[ \t]{2,}", " ", text).strip()
+        return text
+
+
+    def _sanitize_any(obj: Any) -> Any:
+        """Recursively sanitize strings in any dict/list/tuple payloads."""
+        if isinstance(obj, str):
+            out = _format_time_for_tts(obj)
+            if out != obj:
+                # Optional trace; comment out if too chatty
+                # print(f"[tts-sanitize] '{obj}' -> '{out}'")
+                pass
+            return out
+        if isinstance(obj, dict):
+            return {k: _sanitize_any(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_sanitize_any(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(_sanitize_any(v) for v in obj)
+        return obj
+
+    # Helper to patch a callable attribute if present
+    def _patch(obj, attr, wrapper_maker):
+        if hasattr(obj, attr) and callable(getattr(obj, attr)):
+            orig = getattr(obj, attr)
+            wrapped = wrapper_maker(orig)
+            setattr(obj, attr, wrapped)
+            return True
+        return False
+
+    # ---- Patch session.update ----
+    _patch(session, "update", lambda orig: (lambda payload=None, **kw: orig(_sanitize_any(payload), **kw)))
+
+    # ---- Patch session.say ----
+    _patch(session, "say",    lambda orig: (lambda text: orig(_format_time_for_tts(text))))
+
+    # ---- Patch session.generate_reply ----
+    def _wrap_generate_reply(orig):
+        async def _gen(*args, **kw):
+            args = list(args)
+            if args and isinstance(args[0], str):
+                args[0] = _format_time_for_tts(args[0])
+            if "instructions" in kw and isinstance(kw["instructions"], str):
+                kw = dict(kw); kw["instructions"] = _format_time_for_tts(kw["instructions"])
+            return await orig(*args, **kw)
+        return _gen
+    if hasattr(session, "generate_reply") and callable(session.generate_reply):
+        session.generate_reply = _wrap_generate_reply(session.generate_reply)
+
+    # ---- Patch response.create (common for Realtime/agents) ----
+    def _wrap_response_create(sess):
+        robj = getattr(sess, "response", None)
+        if not robj or getattr(robj, "_tts_sanitizer_wrapped", False):
+            return
+        _orig = robj.create
+        async def _create(payload):
+            return await _orig(_sanitize_any(payload))
+        robj.create = _create  # type: ignore
+        robj._tts_sanitizer_wrapped = True
+    if getattr(session, "response", None) and hasattr(session.response, "create"):
+        _wrap_response_create(session)
+
+    # ---- Patch session.send_event (many SDKs route response.create this way) ----
+    def _wrap_send_event(orig):
+        async def _send(payload):
+            return await orig(_sanitize_any(payload))
+        return _send
+    if hasattr(session, "send_event") and callable(session.send_event):
+        session.send_event = _wrap_send_event(session.send_event)
+
+    # ---- Patch raw websocket JSON (last resort path) ----
+    ws = getattr(session, "ws", None)
+    if ws and hasattr(ws, "send_json") and callable(ws.send_json):
+        orig = ws.send_json
+        async def _send_json(payload):
+            return await orig(_sanitize_any(payload))
+        ws.send_json = _send_json  # type: ignore

@@ -525,6 +525,8 @@ class AutomotiveBookingAssistant(Agent):
         # Get last 10 digits of phone number
         phone_10_digits = ''.join(filter(str.isdigit, phone))[-10:] if phone else ""
         
+        log.info(f"Writing customer info to external API phone: {phone} - phone_10_digits {phone_10_digits} - fn: {first_name}")
+
         # Build API URL and payload
         api_url = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/write"
         payload = {
@@ -1007,13 +1009,14 @@ class AutomotiveBookingAssistant(Agent):
         return await self.save_services_detail(context, services, transportation, mileage)
 
     @function_tool
-    async def check_available_slots(self, context: RunContext, preferred_date: Optional[str] = None) -> str:
+    #Added preferred_time
+    async def check_available_slots(self, context: RunContext, preferred_date: Optional[str] = None, preferred_time: Optional[str] = None) -> str:
         """Check available time slots for a specific date.
         
         Args:
             preferred_date: Preferred date in YYYY-MM-DD format (optional)
         """
-        log.info(f"Checking available slots for date: {preferred_date}")
+        log.info(f"Checking available slots for date: {preferred_date} and time {preferred_time}")
         
         if preferred_date:
             # Check if preferred date has available slots

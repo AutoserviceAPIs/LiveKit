@@ -5,7 +5,7 @@
 
 # your AutomotiveBookingAssistant base class/logic
 from .agent_customerdata import CARS_URL
-from .agent_common import CONFIRM_BY_LANG, normalize_lang
+from .agent_common import CONFIRM_BY_LANG, LANG_MAP, normalize_lang
 from .agent_supervisor import LanguageSupervisor
 from livekit import agents, rtc, api, agents
 from livekit.agents.metrics import TTSMetrics
@@ -55,6 +55,7 @@ class AutomotiveBookingAssistant(Agent):
         self._is_shutting_down         = False
         self._timeouts                 = 0
         self.supervisor                = supervisor or lang_switch_q
+        self._suppress_responses       = False
         self._background_state         = {"task": None, "source": None}
         self._found_appt_id            = 0            #If appointment is found
         self.customer_data = {
@@ -198,6 +199,8 @@ class AutomotiveBookingAssistant(Agent):
             return await self.session.say(text)
 
         if hasattr(self.session, "generate_reply") and callable(self.session.generate_reply):
+            if getattr(self, "_suppress_responses", False):
+                return
             return await self.session.generate_reply(text)
 
         # 5) Last resort: don’t crash
@@ -336,7 +339,8 @@ class AutomotiveBookingAssistant(Agent):
             
         if self._current_state == "get name":
             # 1st timeout
-            reprompt = "Whenever you are ready, please tell me your first and last name."
+            reprompt = "take your time, let me know when u are ready"
+            #reprompt = "Whenever you are ready, please tell me your first and last name."
             self._current_state = "get ymm"            # advance after reprompt
             await self._session_ref.say(reprompt)
 
@@ -411,15 +415,13 @@ class AutomotiveBookingAssistant(Agent):
         return slots
 
 
+    # --- REPLACE your start_background with this ---
     async def start_background(self, room: rtc.Room, file_path: str):
-        # ffmpeg decode mp3 -> PCM 16-bit, 48kHz, mono
+        # ffmpeg: decode to PCM 16-bit, 48 kHz, mono
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-i", file_path,
-            "-f", "s16le",
-            "-acodec", "pcm_s16le",
-            "-ar", "48000",
-            "-ac", "1",
+            "ffmpeg", "-i", file_path,
+            "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ar", "48000", "-ac", "1",
             "pipe:1",
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -429,28 +431,25 @@ class AutomotiveBookingAssistant(Agent):
 
         source = rtc.AudioSource(48000, 1)
         track = rtc.LocalAudioTrack.create_audio_track("background", source)
-        await room.local_participant.publish_track(track)
+
+        # Keep the publication SID so we can unpublish cleanly later
+        publication = await room.local_participant.publish_track(track)
+        pub_sid = getattr(publication, "sid", None)
 
         async def read_audio():
-            frame_size = 960  # 20ms @ 48kHz
+            frame_size = 960      # 20 ms @ 48kHz
             bytes_per_sample = 2
             chunk_size = frame_size * bytes_per_sample
-            buffer = b""  # Buffer to accumulate audio data
-            
+            buffer = b""
             try:
                 while True:
-                    # Read smaller chunks to avoid blocking
                     chunk = await process.stdout.read(1024)
                     if not chunk:
                         break
-                    
                     buffer += chunk
-                    
-                    # Process complete frames from buffer
                     while len(buffer) >= chunk_size:
                         frame_data = buffer[:chunk_size]
                         buffer = buffer[chunk_size:]
-                        
                         frame = rtc.AudioFrame(
                             data=frame_data,
                             sample_rate=48000,
@@ -458,10 +457,8 @@ class AutomotiveBookingAssistant(Agent):
                             samples_per_channel=frame_size,
                         )
                         await source.capture_frame(frame)
-                        await asyncio.sleep(0.02)
-                        
+                        await asyncio.sleep(0.02)  # pacing: 20 ms
             except asyncio.CancelledError:
-                # graceful exit if we cancel the task
                 pass
             except Exception as e:
                 log.error(f"Error in read_audio: {e}")
@@ -469,44 +466,67 @@ class AutomotiveBookingAssistant(Agent):
 
         task = asyncio.create_task(read_audio())
 
-        # store handles so we can stop later (e.g., in transfer_call)
+        # store handles so we can stop later
         self._background_state = {
-            "process": process, 
-            "task": task, 
-            "track": track, 
-            "source": source
+            "process": process,
+            "task": task,
+            "track": track,
+            "source": source,
+            "room": room,
+            "publication_sid": pub_sid,
         }
+
 
     async def stop_background(self):
         """Stop background audio playback and cleanup resources."""
-        if hasattr(self, '_background_state') and self._background_state:
+        bg = getattr(self, "_background_state", None) or {}
+        task  = bg.get("task")
+        track = bg.get("track")
+        source = bg.get("source")
+        room  = bg.get("room")
+        pub_sid = bg.get("publication_sid")
+        proc = bg.get("process")
+
+        # 1) Stop feeding audio
+        if task:
+            task.cancel()
             try:
-                # Cancel the audio reading task
-                if 'task' in self._background_state:
-                    self._background_state['task'].cancel()
-                    try:
-                        await self._background_state['task']
-                    except asyncio.CancelledError:
-                        pass
-                
-                # Stop the audio track
-                if 'track' in self._background_state:
-                    await self._background_state['track'].stop()
-                
-                # Terminate ffmpeg process
-                if 'process' in self._background_state:
-                    self._background_state['process'].terminate()
-                    try:
-                        await self._background_state['process'].wait()
-                    except asyncio.TimeoutError:
-                        self._background_state['process'].kill()
-                
-                log.info("Background audio stopped and cleaned up")
-                
-            except Exception as e:
-                log.error(f"Error stopping background audio: {e}")
-            finally:
-                self._background_state = {}
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        # 2) Unpublish the local track (this actually stops others from hearing it)
+        try:
+            if room and pub_sid:
+                await room.local_participant.unpublish_track(pub_sid)
+            # Fallback: some SDKs accept a track object or track.sid
+            elif room and hasattr(track, "sid"):
+                await room.local_participant.unpublish_track(track.sid)
+        except Exception as e:
+            log.warning(f"unpublish_track failed: {e}")
+
+        # 3) Close the audio source if supported
+        try:
+            if source and hasattr(source, "close"):
+                source.close()
+        except Exception:
+            pass
+
+        # 4) Terminate ffmpeg process
+        if proc:
+            try:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+            except Exception:
+                pass
+
+        log.info("Background audio stopped and cleaned up")
+        self._background_state = {}
 
     
     # Add hangup_call function according to LiveKit documentation
@@ -627,29 +647,39 @@ class AutomotiveBookingAssistant(Agent):
         if getattr(self, "_handoff_inflight", False):
             return "BUSY"
 
-        canon = normalize_lang(lang)  # "French" -> "fr"
-        SUPPORTED = {"es", "fr"}
+        canon = normalize_lang(lang)  # e.g., "French" -> "fr"
+        log.info(f"set_language lang = {canon}")
+
+        SUPPORTED = {"es", "fr", "hi", "vi"}
         if canon not in SUPPORTED:
             await self.say("Sorry, that language isn’t available right now.")
             return "ERR_UNSUPPORTED_LANG"
 
+        # No-op if already in this language (no beeps)
         if canon == getattr(self, "lang", "en"):
             return "OK"
 
-        #await self.say(f "Please wait while I get you my {lang} colleague …")
-        await self.say(CONFIRM_BY_LANG[lang])
+        # 1) Speak confirmation in the user's requested language (or fallback)
+        key = LANG_MAP.get(lang, lang)  # handles "French" -> "fr", etc.
+        await self.say(CONFIRM_BY_LANG.get(key, CONFIRM_BY_LANG["en"]))
 
         self._handoff_inflight = True
         self._is_shutting_down = True
         try:
+            # Cancel any timers
             try:
                 self.cancel_timeout()
             except Exception:
                 pass
-            if hasattr(self, "bg_stop"):
-                try: await self.bg_stop()
-                except Exception: pass
 
+            # Stop any background audio started by this agent
+            try:
+                if hasattr(self, "stop_background"):
+                    await self.stop_background()
+            except Exception:
+                pass
+
+            # Ensure we have a supervisor (room-scoped)
             if not getattr(self, "supervisor", None):
                 room = getattr(getattr(self._ctx, "room", None), "name", None)
                 if not room:
@@ -657,6 +687,7 @@ class AutomotiveBookingAssistant(Agent):
                     return "ERR_NO_SUPERVISOR"
                 self.supervisor = LanguageSupervisor(room=room, ready_timeout=12.0)
 
+            # Snapshot current state for the new agent
             try:
                 snapshot = self.snapshot_state()
             except Exception:
@@ -666,26 +697,80 @@ class AutomotiveBookingAssistant(Agent):
                     "available_slots": getattr(self, "available_slots", []),
                 }
 
-            # ⬇️ If handoff is slow, DO NOT speak failure—just return and stay muted
+            # --- Immediately mute this agent so it won't talk over the new one ---
+            self._suppress_responses = True
+            try:
+                await self.session.update(input_audio_enabled=False)
+            except Exception:
+                pass
+
+            # 2) Start beeping DURING handoff; stop when READY or on timeout
+            stop_evt = asyncio.Event()
+
+            async def _handoff_beeper():
+                # Non-blocking loop: emits two short beeps every ~0.35s until stop_evt is set
+                try:
+                    while not stop_evt.is_set():
+                        try:
+                            if hasattr(self, "play_beeps"):
+                                await self.play_beeps(
+                                    self.session.room,
+                                    count=2, freq=1000, duration=0.12, gap=0.12, volume=0.38
+                                )
+                        except Exception as e:
+                            log.debug(f"handoff beeper suppressed: {e}")
+                            await asyncio.sleep(0.3)
+                        # brief spacing between beep pairs unless stopped
+                        try:
+                            await asyncio.wait_for(stop_evt.wait(), timeout=0.35)
+                        except asyncio.TimeoutError:
+                            pass
+                except Exception as e:
+                    log.warning(f"handoff beeper error: {e}")
+
+            beep_task = asyncio.create_task(_handoff_beeper())
+
+            # 3) Spawn new language agent and wait for READY
             try:
                 await self.supervisor.handoff(canon, state_snapshot=snapshot)
             except TimeoutError:
-                # FR agent may still be starting; keep EN silent and let FR greet when ready
+                # Keep this agent muted; stop beeps; let FR/other agent greet when ready
+                stop_evt.set()
+                try:
+                    await asyncio.wait_for(beep_task, timeout=0.3)
+                except Exception:
+                    beep_task.cancel()
                 return "PENDING"
 
-            # Child is READY → shut down EN
-            try: await self.shutdown()
-            except Exception: pass
+            # READY received → stop beeps
+            stop_evt.set()
+            try:
+                await asyncio.wait_for(beep_task, timeout=0.3)
+            except Exception:
+                beep_task.cancel()
+
+            # 4) Leave the room as the old-language participant (do not tear down the room)
+            try:
+                await self.session.close()
+            except Exception:
+                pass
+
             return "OK"
 
         except Exception as e:
-            # Hard failure: allow EN to resume talking
+            # Hard failure: allow this agent to resume (optional: you might choose to keep it muted)
             self._is_shutting_down = False
+            try:
+                self._suppress_responses = False
+                await self.session.update(input_audio_enabled=True)
+            except Exception:
+                pass
             await self.say("I couldn’t switch languages right now. We can continue here or I can transfer you to a person.")
             return f"ERR_HANDOFF_FAILED:{e}"
 
         finally:
             self._handoff_inflight = False
+
 
 
     @function_tool

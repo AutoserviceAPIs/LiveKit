@@ -26,7 +26,7 @@ from livekit.plugins.elevenlabs import VoiceSettings
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.protocol import room as room_msgs  # ✅ protocol types live here
 from livekit.protocol.sip import TransferSIPParticipantRequest
-import logging, aiohttp, json, os, asyncio, re, time
+import logging, aiohttp, json, os, asyncio, re, time, math
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
@@ -139,35 +139,34 @@ Step 1. Reschedule or Cancel
 
 
 PROMPT_BY_LANG = {
-    "en": f"""You are a professional receptionist for Woodbine Toyota. Help customers book appointments in English only.
+    "en": f"""You are a professional receptionist for {BUSINESSNAME}. Help customers book appointments in English only.
 - If caller requests another language (Spanish, French, Hindi), call tool `set_language` with the requested language.
-- After calling the tool, say "Switching to {{language}}…" and stop responding.
 {COMMON_PROMPT}""",
-    "es": f"""Usted es un recepcionista profesional para Woodbine Toyota. Responda únicamente en español.
+    "es": f"""Usted es un recepcionista profesional para {BUSINESSNAME}. Responda únicamente en español.
 {COMMON_PROMPT}""",
-    "fr": f"""Vous êtes une réceptionniste professionnelle pour Woodbine Toyota. Répondez uniquement en français.
+    "fr": f"""Vous êtes une réceptionniste professionnelle pour {BUSINESSNAME}. Répondez uniquement en français.
 {COMMON_PROMPT}""",
 }
 
 
 GREETING_TEMPLATES = {
     "en": {
-        "full":       "Hello {first}! Welcome back to Woodbine Toyota. My name is Sara. I see you’re calling to schedule an appointment. What service would you like for your {year} {model}?",
-        "no_vehicle": "Hello {first}! Welcome back to Woodbine Toyota. My name is Sara. I see you’re calling to schedule an appointment. What is your car’s year, make, and model?",
-        "no_name":    "Hello! You reached Woodbine Toyota Service. My name is Sara. I’ll be glad to help with your appointment. Who do I have the pleasure of speaking with?",
-        "reschedule": "Hello {first}! I see you have an appointment coming up for your vehicle. Would you like to reschedule your appointment, or could I help you with something else?",
+        "full":       "Hello {first}! Welcome back to {BUSINESSNAME}. This is Sara. I see you’re calling to schedule an appointment. What service would you like for your {year} {model}?",
+        "no_vehicle": "Hello {first}! Welcome back to {BUSINESSNAME}. This is Sara. I see you’re calling to schedule an appointment. What is your car’s year, make, and model?",
+        "no_name":    "Hello! This is Sara from {BUSINESSNAME}. I’ll be glad to help with your appointment. Who do I have the pleasure of speaking with?",
+        "reschedule": "Hello {first}! Welcome back to {BUSINESSNAME}. This is Sara. I see you have an appointment coming up for your vehicle. Would you like to reschedule your appointment, or could I help you with something else?",
     },
     "es": {
-        "full":       "¡Hola {first}! Bienvenido de nuevo a Woodbine Toyota. Me llamo Sara. Veo que desea programar una cita. ¿Qué servicio le gustaría para su {year} {model}?",
-        "no_vehicle": "¡Hola {first}! Bienvenido de nuevo a Woodbine Toyota. Me llamo Sara. Veo que desea programar una cita. ¿Cuál es el año, la marca y el modelo de su auto?",
-        "no_name":    "¡Hola! Ha llamado al servicio de Woodbine Toyota. Me llamo Sara. Con gusto le ayudo con su cita. ¿Con quién tengo el gusto de hablar?",
-        "has_Appt":   "Hola {first_name}, veo que tienes una cita el {appointment_date} a las {appointment_time}. Quieres reprogramarla o cómo puedo ayudarte?",
+        "full":       "¡Hola {first}! Bienvenido de nuevo a {BUSINESSNAME}. Es Sara. Veo que desea programar una cita. ¿Qué servicio le gustaría para su {year} {model}?",
+        "no_vehicle": "¡Hola {first}! Bienvenido de nuevo a {BUSINESSNAME}. Es Sara. Veo que desea programar una cita. ¿Cuál es el año, la marca y el modelo de su auto?",
+        "no_name":    "¡Hola! Ha llamado al servicio de {BUSINESSNAME}. Me llamo Sara. Con gusto le ayudo con su cita. ¿Con quién tengo el gusto de hablar?",
+        "has_Appt":   "Hola {first_name}! Bienvenido de nuevo a {BUSINESSNAME}. Es Sara. veo que tienes una cita el {appointment_date} a las {appointment_time}. Quieres reprogramarla o cómo puedo ayudarte?",
     },
     "fr": {
-        "full":       "Bonjour {first} ! Bienvenue chez Woodbine Toyota. Je m’appelle Sara. Je vois que vous souhaitez prendre un rendez-vous. Quel service désirez-vous pour votre {year} {model} ?",
-        "no_vehicle": "Bonjour {first} ! Bienvenue chez Woodbine Toyota. Je m’appelle Sara. Je vois que vous souhaitez prendre un rendez-vous. Quelle est l’année, la marque et le modèle de votre véhicule ?",
-        "no_name":    "Bonjour ! Vous avez joint le service de Woodbine Toyota. Je m’appelle Sara. Je serai ravie de vous aider à prendre un rendez-vous. Avec qui ai-je le plaisir de parler ?",
-        "has_Appt":   "Bonjour {first_name}, je vois que vous avez un rendez-vous le {appointment_date} à {appointment_time}. Souhaitez-vous le reporter ou comment puis-je vous aider ?",
+        "full":       "Bonjour {first}! Bienvenue chez {BUSINESSNAME}. c'est Sara. Je vois que vous souhaitez prendre un rendez-vous. Quel service désirez-vous pour votre {year} {model} ?",
+        "no_vehicle": "Bonjour {first}! Bienvenue chez {BUSINESSNAME}. C'est] Sara. Je vois que vous souhaitez prendre un rendez-vous. Quelle est l’année, la marque et le modèle de votre véhicule ?",
+        "no_name":    "Bonjour ! Vous avez joint {BUSINESSNAME}. C'est Sara. Je serai ravie de vous aider à prendre un rendez-vous. Avec qui ai-je le plaisir de parler ?",
+        "has_Appt":   "Bonjour {first_name}! Bienvenue chez {BUSINESSNAME}. C'est Sara. je vois que vous avez un rendez-vous le {appointment_date} à {appointment_time}. Souhaitez-vous le reporter ou comment puis-je vous aider ?",
     },
 }
 
@@ -212,6 +211,16 @@ LANG_SYNONYMS = {
 }
 
 
+LANG_MAP = {
+    "French": "fr",
+    "English": "en",
+    "Spanish": "es",
+    "Hindi": "hi",
+    "Vietnamese": "vi",
+    # add others as needed
+}
+
+
 CONFIRM_BY_LANG = {
     "en-US": "Okay, I’ll continue in English.",
     "en":    "Okay, I’ll continue in English.",
@@ -223,10 +232,10 @@ CONFIRM_BY_LANG = {
 }
 
 
-UNSUPPORTED_REPLY = "Sorry, that language isn’t supported yet. I can transfer you to a person if you’d like."
-
-
 SUPPORTED_STT_LANGS = {"en-US","es","fr","hi","vi","vi-VN","zh","zh-CN"}
+
+
+UNSUPPORTED_REPLY = "Sorry, that language isn’t supported yet. I can transfer you to a person if you’d like."
 
 
 async def warm_greeting(agent, lang: str):
@@ -253,30 +262,60 @@ def _pick_state_objects(agent):
     return customer or {}, vehicle or {}
 
 def build_dynamic_greeting_and_next(agent, lang: str):
-    log.info(f"build_dynamic_greeting_and_next")
+    log.info("build_dynamic_greeting_and_next")
+
     customer, vehicle = _pick_state_objects(agent)
+
     first = (customer or {}).get("first") or (customer or {}).get("first_name") or ""
-    last  = (customer or {}).get("last")  or (customer or {}).get("last_name") or ""
-    year  = (vehicle  or {}).get("year")  or (agent.customer_data if hasattr(agent, "customer_data") else {}).get("car_year")  or ""
-    make  = (vehicle  or {}).get("make")  or (agent.customer_data if hasattr(agent, "customer_data") else {}).get("car_make")  or ""
-    model = (vehicle  or {}).get("model") or (agent.customer_data if hasattr(agent, "customer_data") else {}).get("car_model") or ""
+    last  = (customer or {}).get("last")  or (customer or {}).get("last_name")  or ""
+
+    # vehicle fields with customer_data fallbacks
+    cd    = getattr(agent, "customer_data", {}) or {}
+    year  = (vehicle or {}).get("year")  or cd.get("car_year", "")
+    make  = (vehicle or {}).get("make")  or cd.get("car_make", "")
+    model = (vehicle or {}).get("model") or cd.get("car_model", "")
+
+    # make sure we always have a business name
+    business_name = (
+        getattr(agent, "business_name", None)
+        or globals().get("BUSINESSNAME")
+        or "our service department"
+    )
 
     has_name    = bool(first)
     has_vehicle = bool(year and model)
-    has_existing_appointment = bool(agent.customer_data.get("has_existing_appointment"))
-    tmpl = GREETING_TEMPLATES.get(lang, GREETING_TEMPLATES["en"])
-    if has_existing_appointment:
-        text = tmpl["reschedule"].format(first=first)
+    has_existing_appointment = bool(cd.get("has_existing_appointment"))
+
+    # template set with fallback to English
+    tmpl = GREETING_TEMPLATES.get(lang) or GREETING_TEMPLATES.get("en", {})
+
+    # small local formatter to avoid repeating kwargs
+    def F(s: str) -> str:
+        return s.format(
+            first=first, last=last,
+            year=year, make=make, model=model,
+            BUSINESSNAME=business_name,   # supports {BUSINESSNAME}
+            business_name=business_name,  # supports {business_name}
+        )
+
+    if has_existing_appointment and "reschedule" in tmpl:
+        text = F(tmpl["reschedule"])
         next_state = "ask reschedule or cancel"
-    elif has_name and has_vehicle:
-        text = tmpl["full"].format(first=first, year=year, make=make, model=model)
-        next_state = "get service"   # you already use this state name
-    elif has_name and not has_vehicle:
-        text = tmpl["no_vehicle"].format(first=first)
+
+    elif has_name and has_vehicle and "full" in tmpl:
+        text = F(tmpl["full"])
+        next_state = "get service"
+
+    elif has_name and "no_vehicle" in tmpl:
+        text = F(tmpl["no_vehicle"])
         next_state = "get car"
+
     else:
-        text = tmpl["no_name"]
+        # fallback if "no_name" missing
+        text = F(tmpl.get("no_name", "Hi{comma_first} welcome to {business_name}. May I have your first name, please?")
+                   .replace("{comma_first}", f" {first}," if first else ","))
         next_state = "get name"
+
     return text, next_state
 
 
@@ -290,12 +329,13 @@ def _load_snapshot_from_env() -> dict:
         log.warning(f"[COMMON] failed to load snapshot: {e}")
         return {}
 
-def _signal_ready(room: str, lang: str):
+def _signal_ready(room_name: str, lang: str):
+    # Matches your supervisor's wait file: /tmp/{room}-READY-{lang}
     try:
-        READY_FLAG(room, lang).touch()
-        log.info(f"[COMMON] READY sentinel created for {room}/{lang}")
+        Path(f"/tmp/{room_name}-READY-{lang}").touch(exist_ok=True)
+        log.info(f"READY touched for room={room_name} lang={lang}")
     except Exception as e:
-        log.warning(f"[COMMON] READY sentinel failed: {e}")
+        log.warning(f"signal_ready failed: {e}")
 
 
 def choose_prompt_by_flags(lang: str, found_cust: bool, found_appt: bool) -> str:
@@ -330,177 +370,170 @@ def _release_room_lock(room_name: str) -> None:
 
 
 async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tools=None):
-    """
-    Shared entrypoint used by agent_en/es/fr wrappers.
-    - Builds a session with STT/TTS for `lang`
-    - Creates AutomotiveBookingAssistant with the right prompt
-    - Restores snapshot from supervisor
-    - Signals READY for the supervisor
-    - Greets once (language-aware) AFTER connect
-    """
     log.info(f"run_language_agent_entrypoint - lang {lang}")
 
-    room_obj   = getattr(ctx, "room", None)
-    room_name  = getattr(room_obj, "name", None) or os.getenv("HANDOFF_ROOM") or "unknown_room"
+    # Determine room name once (from ctx if available, else env)
+    room_obj  = getattr(ctx, "room", None)
+    room_name = getattr(room_obj, "name", None) or os.getenv("HANDOFF_ROOM") or "unknown_room"
     ctx.log_context_fields = {"room": room_name}
 
-    # one process per room
+    # singleflight acquire (do it once and release once at the end)
     if not _singleflight_room(room_name):
         log.warning(f"[{lang}] duplicate entrypoint for room={room_name}; exiting")
         return
 
     try:
-        log.info(f"run_language_agent_entrypoint - lang {lang}")
-        # ... NOW do extract_phone_from_room_name(room_name)
+        # Normalize lang early
+        _norm = {"en-US": "en", "en": "en", "es": "es", "fr": "fr", "French": "fr", "English": "en", "Spanish": "es"}
+        lang = _norm.get(lang, lang)
+        assert lang in ("en", "es", "fr"), f"Unsupported lang: {lang}"
+        DEEPGRAM_LANG = {"en": "en-US", "es": "es", "fr": "fr"}
+
+        # Lookup phone/cust seed (use the resolved room_name)
         phone_number = extract_phone_from_room_name(room_name)
-        log.info(f"extract_phone_from_room_name {room_name}")
+        found_cust = found_appt = False
+        seed = {}
+        if phone_number:
+            try:
+                found_cust, found_appt, seed = await lookup_customer_by_phone(phone=phone_number, cars_url=CARS_URL)
+                log.info(f"[{lang}] lookup: found_cust={found_cust} found_appt={found_appt}")
+            except Exception as e:
+                log.warning(f"[{lang}] lookup failed: {e}")
 
-        # do your singleflight lookup here (NOT before the lock)
-        found_cust, found_appt, seed = await lookup_customer_singleflight(phone_number) if phone_number else (False, False, {})
+        # (optional test overrides)
+        # found_cust = False
+        # found_appt = False
 
-        # ... build session, choose prompt, build agent, start, etc.
-        # (rest of your existing code)
+        # Build session (remove ElevenLabs 'speed' to avoid invalid_voice_settings)
+        session = AgentSession(
+            llm=openai.LLM(model=LLM_MODEL),
+            stt=deepgram.STT(model="nova-3", language=DEEPGRAM_LANG[lang], interim_results=True),
+            tts=elevenlabs.TTS(
+                voice_id=VOICE_BY_LANG[lang],
+                model="eleven_flash_v2_5",
+                voice_settings=VoiceSettings(
+                    similarity_boost=0.75,
+                    stability=0.5,
+                    style=0.5,             # if your SDK needs style_exaggeration, rename here
+                    use_speaker_boost=True
+                ),
+            ),
+            turn_detection=MultilingualModel(),
+            vad=ctx.proc.userdata["vad"],
+            preemptive_generation=False,
+        )
+
+        # Choose prompt
+        final_prompt = choose_prompt_by_flags(lang, found_cust, found_appt)
+        if found_appt:
+            final_prompt = FOUND_APPT_PROMPT
+        log.info(f"final_prompt = {final_prompt}")
+
+        # Build agent
+        from .agent_base import AutomotiveBookingAssistant
+        agent = AutomotiveBookingAssistant(
+            session, ctx, None,
+            instructions=final_prompt,
+            lang=lang,
+            supervisor=supervisor,
+        )
+        if phone_number:
+            agent._sip_participant_identity = f'sip_{phone_number}'
+
+        # Seed state
+        if seed:
+            agent.customer_data.update(seed)
+            if found_appt and hasattr(agent, "set_current_state"):
+                agent.set_current_state("cancel reschedule")
+            elif found_cust and hasattr(agent, "set_current_state"):
+                agent.set_current_state("get service")
+            elif hasattr(agent, "set_current_state"):
+                agent.set_current_state("get name")
+
+        # Handlers/metrics/transcript
+        _attach_common_handlers(session, agent, tag=lang.upper())
+        usage_collector = metrics.UsageCollector()
+
+        @session.on("metrics_collected")
+        def _on_metrics_collected(ev: MetricsCollectedEvent):
+            metrics.log_metrics(ev.metrics)
+            usage_collector.collect(ev.metrics)
+            if getattr(agent, "appointment_created", False) and isinstance(ev.metrics, TTSMetrics):
+                dur = getattr(ev.metrics, "audio_duration", 0) or 0
+                if dur > 0:
+                    asyncio.create_task(agent.delayed_hangup(dur + 0.5))
+            if isinstance(ev.metrics, TTSMetrics):
+                dur = getattr(ev.metrics, "audio_duration", 0) or 0
+                if dur > 0:
+                    asyncio.create_task(agent.delayed_timeout_start(dur))
+
+        async def log_usage():
+            summary = usage_collector.get_summary()
+            log.info(f"[{lang}] Usage summary: {summary}")
+        ctx.add_shutdown_callback(log_usage)
+
+        register_transcript_writer(ctx, session, agent)
+
+        # Join/connect BEFORE signaling READY, so the supervisor only proceeds when we’re truly live
+        await start_recording(ctx, agent)  # if this requires the room, move it after session.start
+
+        await session.start(
+            agent=agent,
+            room=ctx.room,   # ctx.room should now reference the same room_name
+            room_input_options=RoomInputOptions(
+                noise_cancellation=noise_cancellation.BVCTelephony(),
+                close_on_disconnect=False
+            ),
+        )
+
+        # Push tools/prompt after start
+        try:
+            upd = {"instructions": final_prompt}
+            if tools:
+                upd.update({"tools": tools, "tool_choice": "auto"})
+            if hasattr(session, "update"):
+                await session.update(upd)
+            elif hasattr(session, "response") and hasattr(session.response, "session_update"):
+                await session.response.session_update(upd)
+        except Exception as e:
+            log.warning(f"[{lang}] session update failed: {e}")
+
+        # Now that we’re connected & configured, signal READY
+        _signal_ready(room_name, lang)
+
+        # Connect transport if required by your framework (some templates need this earlier)
+        try:
+            await ctx.connect()
+        except Exception as e:
+            log.warning(f"[{lang}] ctx.connect failed or already connected: {e}")
+
+
+        #Play beeps before connection is completed
+        try:
+            await agent.play_beeps(ctx.room, count=2, freq=1000, duration=0.15, gap=0.15, volume=0.4)
+        except Exception as e:
+            log.warning(f"[{lang}] beep playback failed: {e}")
+
+
+        # Optional background
+        try:
+            await agent.start_background(ctx.room, "office.mp3")
+        except Exception as e:
+            log.warning(f"[{lang}] start_background failed: {e}")
+
+        # Greet
+        greet_text, next_state = build_dynamic_greeting_and_next(agent, lang)
+        if hasattr(agent, "set_current_state"):
+            agent.set_current_state(next_state)
+        else:
+            agent.state["progress"] = next_state
+
+        log.info(f"run_language_agent_entrypoint - Greet text: {greet_text}")
+        await agent.say(greet_text)
 
     finally:
-        # release startup lock once we’ve finished initializing (or exited early with error)
+        # release singleflight exactly once
         _release_room_lock(room_name)
-
-    room_name = ctx.room.name
-    if not _singleflight_room(room_name):
-        log.warning(f"[{lang}] duplicate entrypoint for room={room_name}; exiting early")
-        return
-
-    # normalize + map for Deepgram
-    _norm = {"en-US": "en", "en": "en", "es": "es", "fr": "fr"}
-    lang = _norm.get(lang, lang)
-    assert lang in ("en", "es", "fr"), f"Unsupported lang: {lang}"
-    DEEPGRAM_LANG = {"en": "en-US", "es": "es", "fr": "fr"}
-
-    ctx.log_context_fields = {"room": ctx.room.name}
-
-    # 1) Build session
-    session = AgentSession(
-        llm=openai.LLM(model=LLM_MODEL),
-        stt=deepgram.STT(model="nova-3", language=DEEPGRAM_LANG[lang], interim_results=True),
-        tts=elevenlabs.TTS(
-            voice_id=VOICE_BY_LANG[lang],
-            model="eleven_flash_v2_5",
-            voice_settings=VoiceSettings(similarity_boost=0.4, speed=1, stability=0.3, style=1, use_speaker_boost=True),
-        ),
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        preemptive_generation=False,
-    )
-
-    # 2) Lookup BEFORE agent exists
-    phone_number = extract_phone_from_room_name(ctx.room.name)
-    found_cust = found_appt = False
-    seed = {}
-    if phone_number:
-        try:
-            found_cust, found_appt, seed = await lookup_customer_by_phone(phone=phone_number, cars_url=CARS_URL)
-            log.info(f"[{lang}] lookup: found_cust={found_cust} found_appt={found_appt}")
-        except Exception as e:
-            log.warning(f"[{lang}] lookup failed: {e}")
-
-    # 3) Choose prompt based on lookup
-    final_prompt = choose_prompt_by_flags(lang, found_cust, found_appt)
-    if found_appt:
-        final_prompt = FOUND_APPT_PROMPT
-    log.info(f"final_prompt = {final_prompt}")
-
-    # 4) Build agent with that prompt, then seed its state
-
-    from .agent_base import AutomotiveBookingAssistant
-    agent = AutomotiveBookingAssistant(
-        session, ctx, None,
-        instructions=final_prompt,
-        lang=lang,
-        supervisor=supervisor,
-    )
-
-    if phone_number:
-        agent._sip_participant_identity = f'sip_{phone_number}'
-
-    # Seed customer_data if we got any
-    if seed:
-        agent.customer_data.update(seed)
-        # Set a sensible starting state
-        if found_appt and hasattr(agent, "set_current_state"):
-            agent.set_current_state("cancel reschedule")
-        elif found_cust and hasattr(agent, "set_current_state"):
-            agent.set_current_state("get service")
-        elif hasattr(agent, "set_current_state"):
-            agent.set_current_state("get name")
-
-    # Handlers / metrics / transcript
-    _attach_common_handlers(session, agent, tag=lang.upper())
-
-    usage_collector = metrics.UsageCollector()
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
-        if getattr(agent, "appointment_created", False) and isinstance(ev.metrics, TTSMetrics):
-            dur = getattr(ev.metrics, "audio_duration", 0) or 0
-            if dur > 0:
-                asyncio.create_task(agent.delayed_hangup(dur + 0.5))
-        if isinstance(ev.metrics, TTSMetrics):
-            dur = getattr(ev.metrics, "audio_duration", 0) or 0
-            if dur > 0:
-                asyncio.create_task(agent.delayed_timeout_start(dur))
-
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        log.info(f"[{lang}] Usage summary: {summary}")
-    ctx.add_shutdown_callback(log_usage)
-
-    register_transcript_writer(ctx, session, agent)
-
-    # 5) Start recording & join room
-    await start_recording(ctx, agent)
-
-    await session.start(
-        agent=agent,
-        room=ctx.room,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVCTelephony(),
-            close_on_disconnect=False
-        ),
-    )
-
-    # Push tools (and final prompt again) BEFORE any generation
-    try:
-        upd = {"instructions": final_prompt}
-        if tools:
-            upd.update({"tools": tools, "tool_choice": "auto"})
-        if hasattr(session, "update"):
-            await session.update(upd)
-        elif hasattr(session, "response") and hasattr(session.response, "session_update"):
-            await session.response.session_update(upd)
-    except Exception as e:
-        log.warning(f"[{lang}] session update failed: {e}")
-
-    # Signal READY to supervisor
-    room = os.environ.get("HANDOFF_ROOM", ctx.room.name)
-    _signal_ready(room, lang)
-
-    # 6) Connect + greet once
-    await ctx.connect()
-    try:
-        await agent.start_background(ctx.room, "office_48k_mono.wav")  # prefer WAV or use your MP3-safe loader
-    except Exception as e:
-        log.warning(f"[{lang}] start_background failed: {e}")
-
-    greet_text, next_state = build_dynamic_greeting_and_next(agent, lang)
-    if hasattr(agent, "set_current_state"):
-        agent.set_current_state(next_state)
-    else:
-        agent.state["progress"] = next_state
-
-    log.info(f"run_language_agent_entrypoint - Greet text: {greet_text}")
-
-    await agent.say(greet_text)
 
 
 def _attach_common_handlers(session: "AgentSession", agent, tag: str):
@@ -559,6 +592,7 @@ async def lookup_customer_by_phone(phone: str, *, cars_url: str | None = None):
     Returns: (found_cust: bool, found_appt: bool, seed: dict)
       seed has keys suitable to prefill agent.customer_data
     """
+    log.info(f"lookup_customer_by_phone phone_number: {phone} url: {cars_url}")
     phone10 = _last10(phone)
     if not phone10:
         log.error(f"lookup: invalid phone: {phone!r}")
@@ -776,7 +810,9 @@ def _lookup_cache_paths(phone10: str):
     return Path(base + ".lock"), Path(base + ".json")
 
 
+#FUNCTION DEPRECATED
 async def lookup_customer_singleflight(phone_number: str):
+    log.info(f"lookup_customer_singleflight phone_number: {phone_number}")
     phone10 = _last10(phone_number)
     if not phone10:
         return (False, False, {})
@@ -825,3 +861,53 @@ async def lookup_customer_singleflight(phone_number: str):
                     break
         # Fallback: perform our own lookup (rare)
         return await lookup_customer_by_phone(phone=phone_number, cars_url=CARS_URL)
+
+
+
+async def play_beeps(self, room: rtc.Room, *, count=2, freq=1000, duration=0.15, gap=0.15, volume=0.4):
+    """
+    Play short beeps into the room using the same pipeline as background audio.
+    - count:   number of beeps
+    - freq:    beep frequency in Hz
+    - duration:seconds each beep lasts
+    - gap:     seconds between beeps
+    - volume:  0..1 amplitude
+    """
+    sample_rate = 48000
+    samples_per_beep = int(sample_rate * duration)
+    samples_gap = int(sample_rate * gap)
+    frame_size = 960  # 20ms at 48kHz
+    bytes_per_sample = 2
+
+    source = rtc.AudioSource(sample_rate, 1)
+    track = rtc.LocalAudioTrack.create_audio_track("beep", source)
+    pub = await room.local_participant.publish_track(track)
+
+    async def _beep_task():
+        try:
+            for _ in range(count):
+                # Generate sine wave beep
+                for n in range(0, samples_per_beep, frame_size):
+                    frame_len = min(frame_size, samples_per_beep - n)
+                    # 16-bit PCM samples
+                    frame_data = bytearray()
+                    for i in range(frame_len):
+                        t = (n + i) / sample_rate
+                        val = int(volume * 32767 * math.sin(2 * math.pi * freq * t))
+                        frame_data += val.to_bytes(2, byteorder="little", signed=True)
+                    frame = rtc.AudioFrame(
+                        data=bytes(frame_data),
+                        sample_rate=sample_rate,
+                        num_channels=1,
+                        samples_per_channel=frame_len,
+                    )
+                    await source.capture_frame(frame)
+                    await asyncio.sleep(frame_len / sample_rate)
+                # silence gap
+                await asyncio.sleep(gap)
+        finally:
+            # unpublish when done
+            await room.local_participant.unpublish_track(pub.sid)
+            source.close()
+
+    await _beep_task()

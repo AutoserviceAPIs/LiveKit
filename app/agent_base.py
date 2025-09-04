@@ -6,7 +6,7 @@
 # your AutomotiveBookingAssistant base class/logic
 from .agent_customerdata import CARS_URL
 from .agent_common import CONFIRM_BY_LANG, LANG_MAP, normalize_lang, play_beeps
-from .agent_supervisor import LanguageSupervisor
+from .agent_supervisor import LanguageSupervisor, OneShotSupervisor
 from livekit import agents, rtc, api, agents
 from livekit.agents.metrics import TTSMetrics
 from livekit.protocol import room as room_msgs  # ✅ protocol types live here
@@ -418,6 +418,139 @@ class AutomotiveBookingAssistant(Agent):
         
         return slots
 
+    async def _fetch_available_dates_from_api(self):
+        """Fetch available dates from external API and store them in self.available_slots"""
+        log.info("Fetching available dates from external API")
+        
+        # Get customer data
+        first_name = self.customer_data.get("first_name", "")
+        last_name = self.customer_data.get("last_name", "")
+        car_make = self.customer_data.get("car_make", "")
+        car_model = self.customer_data.get("car_model", "")
+        car_year = self.customer_data.get("car_year", "")
+        phone = self.customer_data.get("phone", "")
+        services = self.customer_data.get("services", [])
+        transportation = self.customer_data.get("transportation", "")
+        
+        # Convert services to API format
+        service_codes = []
+        for service in services:
+            service_code = self.service_mapping.get(service.lower(), "FALLBACK")
+            service_codes.append(service_code)
+        
+        # Join services with dash
+        services_param = "-".join(service_codes) if service_codes else "FALLBACK"
+        
+        # Convert transportation to UUID format
+        transportation_uuid = self.transportation_mapping.get(transportation, "00000000-0000-0000-0000-000000000000")
+        
+        # Get current date for preferredDate
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        
+        # Build API URL with parameters
+        base_url = "https://ffayzs7k9i.execute-api.us-east-1.amazonaws.com/pbssystems/check"
+        params = {
+            "id": "WOODBINETOYO",
+            "dealer": "5337",
+            "fname": first_name,
+            "lname": last_name,
+            "fallbackService": "FALLBACK",
+            "serviceOriginal": ", ".join(services),
+            "make": car_make,
+            "model": car_model,
+            "year": car_year,
+            "phone": phone,
+            "services": services_param,
+            "transportation": transportation_uuid,
+            "Time": "06:29:00",  # Default time as requested
+            "preferredDate": current_date
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(base_url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        log.info(f"API response: {data}")
+                        
+                        if not data.get("error") and "dates" in data:
+                            dates = data["dates"]
+                            log.info(f"Received {len(dates)} available dates from API")
+                            
+                            # Store dates in self.available_slots
+                            self.available_slots = {}
+                            for date_str in dates:
+                                # Parse ISO datetime string (e.g., "2025-09-06T08:00:00")
+                                try:
+                                    dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                                    date_key = dt.strftime("%Y-%m-%d")
+                                    time_str = dt.strftime("%H:%M")
+                                    
+                                    if date_key not in self.available_slots:
+                                        self.available_slots[date_key] = []
+                                    
+                                    if time_str not in self.available_slots[date_key]:
+                                        self.available_slots[date_key].append(time_str)
+                                        
+                                except Exception as e:
+                                    log.warning(f"Failed to parse date {date_str}: {e}")
+                                    continue
+                            
+                            # Sort times for each date
+                            for date_key in self.available_slots:
+                                self.available_slots[date_key].sort()
+                            
+                            log.info(f"Processed available slots: {self.available_slots}")
+                        else:
+                            log.error(f"API returned error: {data}")
+                    else:
+                        log.error(f"API call failed with status {response.status}")
+                        
+        except Exception as e:
+            log.error(f"Error calling API: {e}")
+            raise
+
+    async def _write_customer_info_to_api(self):
+        """Write customer information to external API"""
+        log.info("Writing customer info to external API")
+        
+        # Get customer data
+        first_name = self.customer_data.get("first_name", "")
+        last_name = self.customer_data.get("last_name", "")
+        car_make = self.customer_data.get("car_make", "")
+        car_model = self.customer_data.get("car_model", "")
+        car_year = self.customer_data.get("car_year", "")
+        phone = self.customer_data.get("phone", "")
+        
+        # Get last 10 digits of phone number
+        phone_10_digits = ''.join(filter(str.isdigit, phone))[-10:] if phone else ""
+        
+        # Build API URL and payload
+        api_url = "https://fvpww7a95k.execute-api.us-east-1.amazonaws.com/infor/write"
+        payload = {
+            "fname": first_name,
+            "lname": last_name,
+            "make": car_make,
+            "model": car_model,
+            "year": car_year,
+            "phone": phone_10_digits
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(api_url, json=payload, headers={"Content-Type": "application/json"}) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        log.info(f"Customer info written successfully: {data}")
+                    else:
+                        log.error(f"Failed to write customer info: HTTP {response.status}")
+                        response_text = await response.text()
+                        log.error(f"Response: {response_text}")
+                        
+        except Exception as e:
+            log.error(f"Error writing customer info to API: {e}")
+            raise
+
 
     # --- REPLACE your start_background with this ---
     async def start_background(self, room: rtc.Room, file_path: str):
@@ -811,11 +944,13 @@ class AutomotiveBookingAssistant(Agent):
             transportation: Drop off or wait (DROP_OFF or WAITER)
             mileage: Car mileage (optional)
         """
-        log.info(f"Saving services: {services}, transportation: {transportation}")
+        log.info(f"Saving services: {services}, transportation: {transportation}, mileage: {mileage}")
         
         self.customer_data["services"] = services
         self.customer_data["transportation"] = transportation
         self.customer_data["mileage"] = mileage or "0"
+        
+        log.info(f"Customer data updated: {self.customer_data}")
         
         # Determine if maintenance service
         maintenance_services = ["oil change", "maintenance", "tires", "flat", "balance", 
@@ -825,22 +960,51 @@ class AutomotiveBookingAssistant(Agent):
         is_maintenance = any(service.lower() in maintenance_services for service in services)
         self.customer_data["is_maintenance"] = 1 if is_maintenance else 0
         
-        # Get available slots for the next few days
-        available_slots = {}
-        today = datetime.now().date()
-        
-        for i in range(7):  # Next 7 days
-            check_date = today + timedelta(days=i)
-            date_str = check_date.strftime("%Y-%m-%d")
+        # Call external API to get available dates
+        try:
+            await self._fetch_available_dates_from_api()
+        except Exception as e:
+            log.error(f"Failed to fetch available dates from API: {e}")
+            # Fallback to existing logic if API fails
+            available_slots = {}
+            today = datetime.now().date()
             
-            if date_str in self.available_slots:
-                available_slots[date_str] = self.available_slots[date_str]
+            for i in range(7):  # Next 7 days
+                check_date = today + timedelta(days=i)
+                date_str = check_date.strftime("%Y-%m-%d")
+                
+                if date_str in self.available_slots:
+                    available_slots[date_str] = self.available_slots[date_str]
+
+        # Call customer info API
+        try:
+            await self._write_customer_info_to_api()
+        except Exception as e:
+            log.error(f"Failed to write customer info to API: {e}")
 
         self._current_state = "first availability"
         log.info(f"save_services_detail: current_action={self._current_state}")
                                      
-        return f"Service details saved. Available slots for next 7 days: {json.dumps(available_slots)}"
+        return f"Service details saved successfully."
 
+    @function_tool
+    async def validate_and_save_services(self, context: RunContext, services: List[str], 
+                                       transportation: str, mileage: Optional[str] = None) -> str:
+        """Validate that all required data is present and save services detail.
+        
+        This function ensures that save_services_detail is called with all required parameters.
+        """
+        log.info(f"Validating services data: services={services}, transportation={transportation}, mileage={mileage}")
+        
+        # Validate required fields
+        if not services:
+            return "Error: Services are required. Please specify what services are needed."
+        
+        if not transportation:
+            return "Error: Transportation preference is required. Please specify if you will drop off or wait."
+        
+        # Call the main save function
+        return await self.save_services_detail(context, services, transportation, mileage)
 
     @function_tool
     async def check_available_slots(self, context: RunContext, preferred_date: Optional[str] = None) -> str:
@@ -852,22 +1016,98 @@ class AutomotiveBookingAssistant(Agent):
         log.info(f"Checking available slots for date: {preferred_date}")
         
         if preferred_date:
+            # Check if preferred date has available slots
             if preferred_date in self.available_slots:
-                slots = self.available_slots[preferred_date]
-                return f"Available slots on {preferred_date}: {', '.join(slots)}"
+                all_slots = self.available_slots[preferred_date]
+                # Limit to maximum 3 time slots
+                slots = all_slots[:3]
+                
+                # Convert to readable format
+                try:
+                    # Parse the date once
+                    date_obj = datetime.strptime(preferred_date, "%Y-%m-%d")
+                    readable_date = date_obj.strftime("%B %d, %Y")
+                    
+                    # Format times
+                    readable_times = []
+                    for slot in slots:
+                        try:
+                            time_obj = datetime.strptime(slot, "%H:%M")
+                            readable_time = time_obj.strftime("%I:%M %p").lstrip('0')
+                            readable_times.append(readable_time)
+                        except Exception as e:
+                            log.warning(f"Failed to format slot {slot}: {e}")
+                            readable_times.append(slot)
+                    
+                    # Format with "and" for the last item
+                    if len(readable_times) == 1:
+                        time_str = readable_times[0]
+                    elif len(readable_times) == 2:
+                        time_str = f"{readable_times[0]} and {readable_times[1]}"
+                    else:
+                        time_str = f"{', '.join(readable_times[:-1])} and {readable_times[-1]}"
+                    
+                    return f"Available slots: {readable_date} at {time_str}"
+                except Exception as e:
+                    log.warning(f"Failed to format date {preferred_date}: {e}")
+                    return f"Available slots on {preferred_date}: {', '.join(slots)}"
             else:
                 return f"No available slots on {preferred_date}"
         else:
-            # Return next 3 available dates
-            available_dates = list(self.available_slots.keys())[:3]
-            result = {}
-            for date in available_dates:
-                result[date] = self.available_slots[date]
-
-            self._current_state = "check availability"
-            log.info(f"check_available_slots: current_action={self._current_state}")
-
-            return f"Next available dates: {json.dumps(result)}"
+            # Return only 1 date with up to 3 time slots, prioritizing same day if available
+            today = datetime.now().strftime("%Y-%m-%d")
+            available_dates = list(self.available_slots.keys())
+            
+            # Sort dates to prioritize today first, then chronological order
+            def sort_key(date_str):
+                if date_str == today:
+                    return (0, date_str)  # Today gets highest priority
+                else:
+                    return (1, date_str)  # Other dates in chronological order
+            
+            available_dates.sort(key=sort_key)
+            
+            # Take only the first (best) date
+            if available_dates:
+                best_date = available_dates[0]
+                all_slots = self.available_slots[best_date]
+                # Limit to maximum 3 time slots
+                slots = all_slots[:3]
+                
+                # Convert to readable format
+                try:
+                    # Parse the date once
+                    date_obj = datetime.strptime(best_date, "%Y-%m-%d")
+                    readable_date = date_obj.strftime("%B %d, %Y")
+                    
+                    # Format times
+                    readable_times = []
+                    for slot in slots:
+                        try:
+                            time_obj = datetime.strptime(slot, "%H:%M")
+                            readable_time = time_obj.strftime("%I:%M %p").lstrip('0')
+                            readable_times.append(readable_time)
+                        except Exception as e:
+                            log.warning(f"Failed to format slot {slot}: {e}")
+                            readable_times.append(slot)
+                    
+                    # Format with "and" for the last item
+                    if len(readable_times) == 1:
+                        time_str = readable_times[0]
+                    elif len(readable_times) == 2:
+                        time_str = f"{readable_times[0]} and {readable_times[1]}"
+                    else:
+                        time_str = f"{', '.join(readable_times[:-1])} and {readable_times[-1]}"
+                    
+                    self._current_state = "check availability"
+                    log.info(f"check_available_slots: current_action={self._current_state}")
+                    
+                    return f"Available slots: {readable_date} at {time_str}"
+                except Exception as e:
+                    log.warning(f"Failed to format date {best_date}: {e}")
+                    return f"Available slots on {best_date}: {', '.join(slots)}"
+            else:
+                return "No available slots found"
 
 
     @function_tool
@@ -916,9 +1156,6 @@ class AutomotiveBookingAssistant(Agent):
         
         # In a real implementation, you would save this to a database
         log.info(f"Appointment created: {json.dumps(appointment_data)}")
-        
-        # Set flag to indicate appointment was created - this will trigger hangup after goodbye
-        self.appointment_created = True
         
         # Set flag to indicate appointment was created - this will trigger hangup after goodbye
         self.appointment_created = True
@@ -989,7 +1226,7 @@ class AutomotiveBookingAssistant(Agent):
         Args:
             appointment_id
         """
-        log.info(f"cancel_appointment for {first_name} {last_name} on {selected_date} at {selected_time}")        
+        log.info(f"cancel_appointment for appointment_id: {appointment_id}")        
         return f"Appointment cancelled! We'll send a confirmation message shortly. Have a great day!"
 
 

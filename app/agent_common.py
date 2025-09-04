@@ -42,20 +42,31 @@ LLM_MODEL = "gpt-4o-mini"
 #Step6: - After services, transportation captured: Thank user, offer the first availability and ask if that will work, or if the user has a specific time
 #If first availability works for user, book it
 #Else:
+# Get current date for the prompt
+from datetime import datetime
+current_date = datetime.now().strftime("%Y-%m-%d")
+current_date_readable = datetime.now().strftime("%A, %B %d, %Y")
+
 COMMON_PROMPT = f"""You are a booking assistant. Help customers book appointments.
+
+## CURRENT DATE INFORMATION:
+- Today's date is: {current_date} ({current_date_readable})
+- Use this information when customers ask about "today", "tomorrow", or specific dates
 
 ## CUSTOMER LOOKUP:
 - At the beginning of the conversation, call lookup_customer (We already have customer phone number): returns customer name, car details, or booking details.
 
 ## RULES:
 - After collecting car year make and model: call save_customer_information
-- After collecting services and transportation: call save_services_detail
+- After collecting services and transportation: call validate_and_save_services (MANDATORY - must be called immediately after getting transportation)
+- After collecting mileage: call check_available_slots
 - After booking: call create_appointment
 - Do not say things like "Let me save your information" or "Please wait." Just proceed silently to next step
 - For recall: {INSTRUCTIONS_RECALL}
 - For cancel or reschedule appointment: {INSTRUCTIONS_CANCEL_RESCHEDULE}
 - For speak with someone, customer service, or user is frustrated: call transfer_call
 - Never say that you saved information
+- CRITICAL: Always call validate_and_save_services immediately after getting transportation response
 
 - For address: {BUSINESSLOCATION}
 - For price: {INSTRUCTIONS_PRICING}
@@ -84,14 +95,14 @@ Step 3. Gather services
 Step 4. Gather transportation
 - After capture services, Ask if will be dropping off the vehicle or waiting while we do the work
 - Wait for transportation
+- IMMEDIATELY after getting transportation, call validate_and_save_services tool with services and transportation
 - Must go to Step 5 before Step 6
 
 Step 5. Gather mileage
-- call check_available_slots
 - Once transportation captured, Ask what is the mileage
 - Wait for mileage
     - If user does not know mileage, set mileage to 0
-- call save_services_detail tool
+- call check_available_slots to get available dates
 Proceed to Step 6
 
 Step 6. Find availability
@@ -444,7 +455,7 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
         agent.lang = lang  # explicit
         if phone_number:
             agent._sip_participant_identity = f'sip_{phone_number}'
-
+            agent.customer_data["phone"] = phone_number
         # Seed state
         if seed:
             agent.customer_data.update(seed)
@@ -725,7 +736,7 @@ async def start_recording(ctx: JobContext, agent):
 
     # Store recording timestamp for transcript
     agent._recording_timestamp = ts
-    await ctx.api.egress.start_room_composite_egress(req)
+    # await ctx.api.egress.start_room_composite_egress(req)
 
 
 def prewarm(proc: JobProcess):
@@ -808,12 +819,12 @@ def register_transcript_writer(ctx, session, agent, *,
                         if resp.status == 200:
                             log.info(f"History sent OK: {await resp.json()}")
                         else:
-                            logger.error(f"History send failed: {resp.status} {await resp.text()}")
+                            log.error(f"History send failed: {resp.status} {await resp.text()}")
             except Exception as api_err:
-                logger.error(f"Error sending to API: {api_err}")
+                log.error(f"Error sending to API: {api_err}")
 
         except Exception as e:
-            logger.error(f"Failed to write transcript: {e}")
+            log.error(f"Failed to write transcript: {e}")
 
     ctx.add_shutdown_callback(write_transcript)
 

@@ -5,7 +5,7 @@
 
 # your AutomotiveBookingAssistant base class/logic
 from .agent_customerdata import CARS_URL
-from .agent_common import CONFIRM_BY_LANG, LANG_MAP, normalize_lang
+from .agent_common import CONFIRM_BY_LANG, LANG_MAP, normalize_lang, play_beeps
 from .agent_supervisor import LanguageSupervisor
 from livekit import agents, rtc, api, agents
 from livekit.agents.metrics import TTSMetrics
@@ -168,10 +168,14 @@ class AutomotiveBookingAssistant(Agent):
 
     async def say(self, text: str):
         """Speak a short line via whatever the session supports."""
-        if getattr(self, "_is_shutting_down", False):
-            if hasattr(self.session, "history"):
+
+        # If we're shutting down or responses are suppressed (e.g., during handoff),
+        # record it to history (for transcripts) but DO NOT speak.
+        if getattr(self, "_is_shutting_down", False) or getattr(self, "_suppress_responses", False):
+            sess_hist = getattr(self.session, "history", None)
+            if sess_hist and hasattr(sess_hist, "add_assistant_message"):
                 try:
-                    self.session.history.add_assistant_message(text)  # or your equivalent
+                    sess_hist.add_assistant_message(text)
                 except Exception:
                     pass
             return
@@ -199,6 +203,7 @@ class AutomotiveBookingAssistant(Agent):
             return await self.session.say(text)
 
         if hasattr(self.session, "generate_reply") and callable(self.session.generate_reply):
+            # extra guard (should be redundant due to early return)
             if getattr(self, "_suppress_responses", False):
                 return
             return await self.session.generate_reply(text)
@@ -206,7 +211,6 @@ class AutomotiveBookingAssistant(Agent):
         # 5) Last resort: don’t crash
         print(f"[AI SAY fallback] {text}")
         return None
-
 
 
     async def shutdown(self):
@@ -647,7 +651,7 @@ class AutomotiveBookingAssistant(Agent):
         if getattr(self, "_handoff_inflight", False):
             return "BUSY"
 
-        canon = normalize_lang(lang)  # e.g., "French" -> "fr"
+        canon = normalize_lang(lang)  # "Spanish"/"es-ES" -> "es"
         log.info(f"set_language lang = {canon}")
 
         SUPPORTED = {"es", "fr", "hi", "vi"}
@@ -655,39 +659,37 @@ class AutomotiveBookingAssistant(Agent):
             await self.say("Sorry, that language isn’t available right now.")
             return "ERR_UNSUPPORTED_LANG"
 
-        # No-op if already in this language (no beeps)
         if canon == getattr(self, "lang", "en"):
             return "OK"
 
-        # 1) Speak confirmation in the user's requested language (or fallback)
-        key = LANG_MAP.get(lang, lang)  # handles "French" -> "fr", etc.
-        await self.say(CONFIRM_BY_LANG.get(key, CONFIRM_BY_LANG["en"]))
+        # speak confirmation (in requested language if present)
+        key = LANG_MAP.get(lang, lang)
+        confirm_line = CONFIRM_BY_LANG.get(key) or CONFIRM_BY_LANG.get("en", "Switching language…")
+        await self.say(confirm_line)
 
         self._handoff_inflight = True
         self._is_shutting_down = True
-        try:
-            # Cancel any timers
-            try:
-                self.cancel_timeout()
-            except Exception:
-                pass
 
-            # Stop any background audio started by this agent
+        stop_evt = None
+        beep_task = None
+
+        try:
+            try: self.cancel_timeout()
+            except Exception: pass
+
             try:
                 if hasattr(self, "stop_background"):
                     await self.stop_background()
-            except Exception:
-                pass
+            except Exception: pass
 
-            # Ensure we have a supervisor (room-scoped)
             if not getattr(self, "supervisor", None):
                 room = getattr(getattr(self._ctx, "room", None), "name", None)
                 if not room:
                     self._is_shutting_down = False
                     return "ERR_NO_SUPERVISOR"
-                self.supervisor = LanguageSupervisor(room=room, ready_timeout=12.0)
+                # a touch more lenient
+                self.supervisor = OneShotSupervisor(room=room, ready_timeout=18.0)
 
-            # Snapshot current state for the new agent
             try:
                 snapshot = self.snapshot_state()
             except Exception:
@@ -697,80 +699,83 @@ class AutomotiveBookingAssistant(Agent):
                     "available_slots": getattr(self, "available_slots", []),
                 }
 
-            # --- Immediately mute this agent so it won't talk over the new one ---
+            # mute this agent immediately
             self._suppress_responses = True
-            try:
-                await self.session.update(input_audio_enabled=False)
-            except Exception:
-                pass
+            try: await self.session.update(input_audio_enabled=False)
+            except Exception: pass
 
-            # 2) Start beeping DURING handoff; stop when READY or on timeout
+            # cancel any in-flight responses
+            for attr in ("cancel_current_response", "cancel_responses", "cancel_all_responses"):
+                fn = getattr(self.session, attr, None)
+                if callable(fn):
+                    try:
+                        await fn()
+                        break
+                    except Exception:
+                        pass
+
+            # progress beeps while waiting
+            room_for_audio = getattr(self.session, "room", None) or getattr(self._ctx, "room", None)
             stop_evt = asyncio.Event()
 
             async def _handoff_beeper():
-                # Non-blocking loop: emits two short beeps every ~0.35s until stop_evt is set
                 try:
                     while not stop_evt.is_set():
                         try:
-                            if hasattr(self, "play_beeps"):
-                                await self.play_beeps(
-                                    self.session.room,
-                                    count=2, freq=1000, duration=0.12, gap=0.12, volume=0.38
-                                )
+                            if room_for_audio and hasattr(self, "play_beeps"):
+                                await self.play_beeps(room_for_audio, count=2, freq=1000, duration=0.12, gap=0.12, volume=0.38)
                         except Exception as e:
-                            log.debug(f"handoff beeper suppressed: {e}")
+                            log.debug(f"[HANDOFF] beeper suppressed: {e}")
                             await asyncio.sleep(0.3)
-                        # brief spacing between beep pairs unless stopped
                         try:
                             await asyncio.wait_for(stop_evt.wait(), timeout=0.35)
                         except asyncio.TimeoutError:
                             pass
                 except Exception as e:
-                    log.warning(f"handoff beeper error: {e}")
+                    log.warning(f"[HANDOFF] beeper error: {e}")
 
             beep_task = asyncio.create_task(_handoff_beeper())
 
-            # 3) Spawn new language agent and wait for READY
+            # spawn child and wait READY
+            log.info(f"[HANDOFF] about to call supervisor.handoff(lang={canon}) supervisor={type(self.supervisor).__name__} id={id(self.supervisor)}")
             try:
                 await self.supervisor.handoff(canon, state_snapshot=snapshot)
+                log.info("[HANDOFF] supervisor.handoff() returned READY")
             except TimeoutError:
-                # Keep this agent muted; stop beeps; let FR/other agent greet when ready
-                stop_evt.set()
-                try:
-                    await asyncio.wait_for(beep_task, timeout=0.3)
-                except Exception:
-                    beep_task.cancel()
+                log.warning(f"[HANDOFF] timeout waiting READY for {canon}")
+                # treat as pending (keep EN muted, no apology)
                 return "PENDING"
+            except RuntimeError as e:
+                # e.g., "child exited BEFORE READY" → treat like pending so we don't interrupt UX
+                log.warning(f"[HANDOFF] child error treated as PENDING: {e}")
+                return "PENDING"
+            except Exception as e:
+                log.exception(f"[HANDOFF] handoff() raised: {e}")
+                # restore minimal ability to speak apology
+                self._is_shutting_down = False
+                try:
+                    self._suppress_responses = False
+                    await self.session.update(input_audio_enabled=True)
+                except Exception: pass
+                await self.say("I couldn’t switch languages right now. We can continue here or I can transfer you to a person.")
+                return f"ERR_HANDOFF_FAILED:{e}"
+            finally:
+                # stop beeps on any path
+                if stop_evt: stop_evt.set()
+                if beep_task:
+                    try:
+                        await asyncio.wait_for(beep_task, timeout=0.3)
+                    except Exception:
+                        beep_task.cancel()
 
-            # READY received → stop beeps
-            stop_evt.set()
-            try:
-                await asyncio.wait_for(beep_task, timeout=0.3)
-            except Exception:
-                beep_task.cancel()
-
-            # 4) Leave the room as the old-language participant (do not tear down the room)
-            try:
-                await self.session.close()
-            except Exception:
-                pass
+            # READY → leave the room as EN
+            try: await self.session.close()
+            except Exception: pass
 
             return "OK"
 
-        except Exception as e:
-            # Hard failure: allow this agent to resume (optional: you might choose to keep it muted)
-            self._is_shutting_down = False
-            try:
-                self._suppress_responses = False
-                await self.session.update(input_audio_enabled=True)
-            except Exception:
-                pass
-            await self.say("I couldn’t switch languages right now. We can continue here or I can transfer you to a person.")
-            return f"ERR_HANDOFF_FAILED:{e}"
-
         finally:
             self._handoff_inflight = False
-
 
 
     @function_tool

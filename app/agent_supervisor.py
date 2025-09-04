@@ -1,7 +1,10 @@
 from .agent_common import normalize_lang
-import asyncio, json, os, sys
+import asyncio, json, os, sys, logging
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger("agent")
+
 
 MODULE_BY_LANG = {
     "es": "app.agent_es",
@@ -10,20 +13,13 @@ MODULE_BY_LANG = {
     "hi": "app.agent_hi", 
 }
 
-class LanguageSupervisor:
-    """
-    Spawns a language-specific agent into the SAME LiveKit room,
-    waits for a READY sentinel, and returns control so the caller (EN agent)
-    can shut itself down.
-    """
 
-    def __init__(self, room: str, ready_timeout: float = 15.0):
+class LanguageSupervisor:
+    def __init__(self, room: str, ready_timeout: float = 18.0):
         self.room = room
         self.ready_timeout = ready_timeout
-        self.child_proc: Optional[asyncio.subprocess.Process] = None
-        self.child_lang: Optional[str] = None
-
-    # ---------- paths / sentinels ----------
+        self.child_proc: asyncio.subprocess.Process | None = None
+        self.child_lang: str | None = None
 
     def _state_path(self) -> Path:
         return Path(f"/tmp/{self.room}-handoff.json")
@@ -31,67 +27,111 @@ class LanguageSupervisor:
     def _ready_flag(self, lang: str) -> Path:
         return Path(f"/tmp/{self.room}-READY-{lang}")
 
-    # ---------- core API ----------
-
     async def start_agent(self, lang: str, state_snapshot: dict | None = None):
-        """
-        Spawn the language agent process (es/fr) and wait until it signals READY.
-        Does NOT kill the current (EN) process; caller should silence itself before calling.
-        """
+        log.info("***********SUPERVISOR***************")
+        print(f"[SUPERVISOR] start_agent(lang={lang}) room={self.room}", flush=True)
         canon = normalize_lang(lang)
-        if canon not in MODULE_BY_LANG:
+        module = MODULE_BY_LANG.get(canon)
+        if not module:
+            print(f"[SUPERVISOR] unsupported lang {lang!r} (canon={canon})", flush=True)
             raise ValueError(f"Unsupported language '{lang}'")
 
-        module = MODULE_BY_LANG[canon]
-
-        # 1) write the handoff snapshot to a temp file
+        # 1) Write snapshot
         state_path = self._state_path()
-        if state_snapshot is None:
-            state_snapshot = {}
         try:
-            state_path.write_text(json.dumps(state_snapshot), encoding="utf-8")
+            state_path.write_text(json.dumps(state_snapshot or {}), encoding="utf-8")
+            print(f"[SUPERVISOR] wrote snapshot → {state_path}", flush=True)
         except Exception as e:
-            print(f"[SUPERVISOR] failed to write state snapshot: {e}")
+            print(f"[SUPERVISOR] failed to write snapshot: {e}", flush=True)
 
-        # 2) remove any old READY flags
-        ready_flag = self._ready_flag(lang)
+        # 2) Clear old READY flag
+        ready_flag = self._ready_flag(canon)
         try:
             if ready_flag.exists():
                 ready_flag.unlink()
-        except Exception:
-            pass
+            print(f"[SUPERVISOR] cleared READY flag → {ready_flag}", flush=True)
+        except Exception as e:
+            print(f"[SUPERVISOR] could not clear READY flag: {e}", flush=True)
+        print(f"[SUPERVISOR] waiting for READY at {ready_flag} (timeout={self.ready_timeout}s)", flush=True)
 
-        # 3) inherit env + pass path to snapshot via env var
+        # 3) Env for child
         env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"             # child prints unbuffered
         env["HANDOFF_STATE_PATH"] = str(state_path)
-        env["HANDOFF_LANG"] = lang
+        env["HANDOFF_LANG"] = canon
         env["HANDOFF_ROOM"] = self.room
 
-        # 4) spawn: python -m app.agent_<lang> connect --room <room>
-        # (Use "connect" because your CLI shows that command; it should join the given room.)
-        cmd = [sys.executable, "-m", module, "connect", "--room", self.room]
-        print(f"[SUPERVISOR] spawning {module} for room={self.room}")
+        # 4) Spawn WITHOUT extra CLI args; your agent module will read HANDOFF_* envs
+        cmd = [sys.executable, "-m", module]
+        print(f"[SUPERVISOR] spawning: {' '.join(cmd)}  (room={self.room}, lang={canon})", flush=True)
+
         self.child_proc = await asyncio.create_subprocess_exec(
             *cmd,
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        self.child_lang = lang
+        self.child_lang = canon
 
-        # 5) wait READY sentinel
-        await self._wait_until_ready(ready_flag, timeout=self.ready_timeout)
+        # 5) Stream child logs
+        async def _stream(pipe, prefix):
+            while True:
+                line = await pipe.readline()
+                if not line:
+                    break
+                print(f"[{prefix}] {line.decode(errors='ignore').rstrip()}", flush=True)
 
+        if self.child_proc.stdout:
+            asyncio.create_task(_stream(self.child_proc.stdout, f"{canon.upper()}-OUT"))
+        if self.child_proc.stderr:
+            asyncio.create_task(_stream(self.child_proc.stderr, f"{canon.upper()}-ERR"))
+
+        # 6) Wait for READY or child exit (whichever happens first)
+        print(f"[SUPERVISOR] waiting for READY at {ready_flag} (timeout={self.ready_timeout}s)", flush=True)
+
+        async def _wait_ready():
+            await self._wait_until_ready(ready_flag, timeout=self.ready_timeout)
+
+        ready_task = asyncio.create_task(_wait_ready())
+        exit_task = asyncio.create_task(self.child_proc.wait())
+
+        done, pending = await asyncio.wait({ready_task, exit_task}, return_when=asyncio.FIRST_COMPLETED)
+
+        if exit_task in done and not ready_task.done():
+            rc = self.child_proc.returncode
+            print(f"[SUPERVISOR] child exited BEFORE READY (rc={rc})", flush=True)
+            for t in pending:
+                t.cancel()
+            print(f"[SUPERVISOR] child exited BEFORE READY (rc={rc})", flush=True)
+            raise RuntimeError(f"Child {module} exited before READY (rc={rc})")
+
+        for t in pending:
+            t.cancel()
+
+        print("[SUPERVISOR] READY received", flush=True)
+
+
+    async def _wait_until_ready(self, ready_flag: Path, timeout: float = 6.0):
+        step = 0.1
+        waited = 0.0
+        while waited < timeout:
+            if ready_flag.exists():
+                try:
+                    ready_flag.unlink()
+                except Exception:
+                    pass
+                return
+            await asyncio.sleep(step)
+            waited += step
+        raise TimeoutError("New agent did not signal READY in time")
+
+ 
     async def handoff(self, lang: str, state_snapshot: dict | None = None):
-        """
-        Public API used by EN agent's set_language() tool handler.
-        """
+        log.info("***********SUPERVISOR: handoff***************")
         await self.start_agent(lang, state_snapshot)
 
     async def stop_child(self):
-        """
-        Optional utility to stop the last spawned child (if you ever need to).
-        """
+        log.info("***********SUPERVISOR: Stop child***************")
         if not self.child_proc:
             return
         try:
@@ -106,24 +146,111 @@ class LanguageSupervisor:
             self.child_proc = None
             self.child_lang = None
 
-    # ---------- helpers ----------
 
-    async def _wait_until_ready(self, ready_flag: Path, timeout: float = 6.0):
-        """
-        Poll a READY sentinel file created by the new agent right after it joins the room.
-        Replace with a datachannel or Redis signal if you prefer.
-        """
-        step = 0.1
-        waited = 0.0
-        while waited < timeout:
+        log.info("***********SUPERVISOR***************")
+
+
+class OneShotSupervisor(LanguageSupervisor):
+    """Supervisor that spawns a single child per (room,lang), streams its logs,
+    and waits for READY or child exit (whichever comes first)."""
+
+    def __init__(self, room: str, ready_timeout: float = 18.0):
+        self.room = room
+        self.ready_timeout = ready_timeout
+        self._spawned: set[str] = set()
+        self.child_proc: asyncio.subprocess.Process | None = None
+        self.child_lang: str | None = None
+
+    def _state_path(self) -> Path:
+        return Path(f"/tmp/{self.room}-handoff.json")
+
+    def _ready_flag(self, lang: str) -> Path:
+        return Path(f"/tmp/{self.room}-READY-{lang}")
+
+    async def start_agent(self, lang: str, state_snapshot: dict | None = None):
+        log.info("***********SUPERVISOR1***************")
+        canon = normalize_lang(lang)
+        module = MODULE_BY_LANG.get(canon)
+        print(f"[SUPERVISOR] start_agent(lang={canon}) room={self.room}", flush=True)
+
+        if not module:
+            print(f"[SUPERVISOR] unsupported lang: {lang!r} (canon={canon})", flush=True)
+            raise ValueError(f"Unsupported language '{lang}'")
+
+        key = f"{self.room}:{canon}"
+        if key in self._spawned:
+            print(f"[SUPERVISOR] {key} already spawned; skipping.", flush=True)
+            return
+
+        # 1) Write snapshot
+        state_path = self._state_path()
+        try:
+            state_path.write_text(json.dumps(state_snapshot or {}), encoding="utf-8")
+            print(f"[SUPERVISOR] wrote snapshot → {state_path}", flush=True)
+        except Exception as e:
+            print(f"[SUPERVISOR] failed to write snapshot: {e}", flush=True)
+
+        # 2) Clear old READY flag
+        ready_flag = self._ready_flag(canon)
+        try:
             if ready_flag.exists():
-                # consume the flag so future waits are clean
-                try:
-                    ready_flag.unlink()
-                except Exception:
-                    pass
-                print("[SUPERVISOR] READY received")
-                return
-            await asyncio.sleep(step)
-            waited += step
-        raise TimeoutError("New agent did not signal READY in time")
+                ready_flag.unlink()
+        except Exception:
+            pass
+
+        # 3) Env for child (unbuffered prints)
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["HANDOFF_STATE_PATH"] = str(state_path)
+        env["HANDOFF_LANG"] = canon
+        env["HANDOFF_ROOM"] = self.room
+
+        # 4) Spawn child WITHOUT extra CLI args. The agent module uses HANDOFF_* envs.
+        cmd = [sys.executable, "-m", module]
+        print(f"[SUPERVISOR] spawning: {' '.join(cmd)}  (room={self.room}, lang={canon})", flush=True)
+
+        self.child_proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self.child_lang = canon
+
+        # 5) Stream child logs immediately so crashes aren’t silent
+        async def _stream(pipe, prefix):
+            while True:
+                line = await pipe.readline()
+                if not line:
+                    break
+                print(f"[{prefix}] {line.decode(errors='ignore').rstrip()}", flush=True)
+
+        if self.child_proc.stdout:
+            asyncio.create_task(_stream(self.child_proc.stdout, f"{canon.upper()}-OUT"))
+        if self.child_proc.stderr:
+            asyncio.create_task(_stream(self.child_proc.stderr, f"{canon.upper()}-ERR"))
+
+        # 6) Wait for READY or child exit (whichever happens first)
+        print(f"[SUPERVISOR] waiting for READY at {ready_flag} (timeout={self.ready_timeout}s)", flush=True)
+
+        async def _wait_ready():
+            await self._wait_until_ready(ready_flag, timeout=self.ready_timeout)
+
+        ready_task = asyncio.create_task(_wait_ready())
+        exit_task  = asyncio.create_task(self.child_proc.wait())
+
+        done, pending = await asyncio.wait({ready_task, exit_task}, return_when=asyncio.FIRST_COMPLETED)
+
+        if exit_task in done and not ready_task.done():
+            rc = self.child_proc.returncode
+            for t in pending:
+                t.cancel()
+            print(f"[SUPERVISOR] child exited BEFORE READY (rc={rc})", flush=True)
+            raise RuntimeError(f"Child {module} exited before READY (rc={rc})")
+
+        for t in pending:
+            t.cancel()
+
+        print("[SUPERVISOR] READY received", flush=True)
+        self._spawned.add(key)
+

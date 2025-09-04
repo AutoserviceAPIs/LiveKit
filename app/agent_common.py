@@ -38,7 +38,10 @@ log = logging.getLogger("agent_common")
 
 LLM_MODEL = "gpt-4o-mini"
 
-
+#Step 6. Offer first availability
+#Step6: - After services, transportation captured: Thank user, offer the first availability and ask if that will work, or if the user has a specific time
+#If first availability works for user, book it
+#Else:
 COMMON_PROMPT = f"""You are a booking assistant. Help customers book appointments.
 
 ## CUSTOMER LOOKUP:
@@ -76,7 +79,7 @@ Step 3. Gather services
       thank user and ask if user is interested in adding wiper blades during the appointment
       Set is_maintenance to 1
   - If user does not know service or wants other services, help them find service, e.g. oil change, diagnostics or repairs
-  - Confirm services before going to step 4
+  - After capture services, go to step 4
 
 Step 4. Gather transportation
 - After capture services, Ask if will be dropping off the vehicle or waiting while we do the work
@@ -91,12 +94,8 @@ Step 5. Gather mileage
 - call save_services_detail tool
 Proceed to Step 6
 
-Step 6. Offer first availability
-- After services, transportation captured: Thank user, offer the first availability and ask if that will work, or if the user has a specific time
-
-Step 7. Find availability
-If first availability works for user, book it
-Else:
+Step 6. Find availability
+- After services, transportation captured: Thank user, ask if they have a preferred date or time for the requested services
     If user provides a period, ask for a date and time
     Once date and time captured:
     If found availability, book it
@@ -372,39 +371,44 @@ def _release_room_lock(room_name: str) -> None:
 async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tools=None):
     log.info(f"run_language_agent_entrypoint - lang {lang}")
 
-    # Determine room name once (from ctx if available, else env)
+    # Resolve room from ctx or env (supervisor sets HANDOFF_ROOM)
     room_obj  = getattr(ctx, "room", None)
     room_name = getattr(room_obj, "name", None) or os.getenv("HANDOFF_ROOM") or "unknown_room"
     ctx.log_context_fields = {"room": room_name}
 
-    # singleflight acquire (do it once and release once at the end)
-    if not _singleflight_room(room_name):
-        log.warning(f"[{lang}] duplicate entrypoint for room={room_name}; exiting")
-        return
+    # Normalize language
+    _norm = {"en-US": "en", "en": "en", "es": "es", "fr": "fr",
+             "French": "fr", "English": "en", "Spanish": "es"}
+    lang = _norm.get(lang, lang)
+    assert lang in ("en", "es", "fr"), f"Unsupported lang: {lang}"
+    DEEPGRAM_LANG = {"en": "en-US", "es": "es", "fr": "fr"}
+
+    # --- singleflight with handoff bypass ---
+    is_handoff_child = (os.getenv("HANDOFF_LANG") == lang)
+    acquired_lock = False
+    if not is_handoff_child:
+        if not _singleflight_room(room_name):
+            log.warning(f"[{lang}] duplicate entrypoint for room={room_name}; exiting")
+            return
+        acquired_lock = True
+    else:
+        log.info(f"[{lang}] handoff child detected; bypassing singleflight for room={room_name}")
 
     try:
-        # Normalize lang early
-        _norm = {"en-US": "en", "en": "en", "es": "es", "fr": "fr", "French": "fr", "English": "en", "Spanish": "es"}
-        lang = _norm.get(lang, lang)
-        assert lang in ("en", "es", "fr"), f"Unsupported lang: {lang}"
-        DEEPGRAM_LANG = {"en": "en-US", "es": "es", "fr": "fr"}
-
-        # Lookup phone/cust seed (use the resolved room_name)
+        # Lookup seed by phone
         phone_number = extract_phone_from_room_name(room_name)
         found_cust = found_appt = False
         seed = {}
         if phone_number:
             try:
-                found_cust, found_appt, seed = await lookup_customer_by_phone(phone=phone_number, cars_url=CARS_URL)
+                found_cust, found_appt, seed = await lookup_customer_by_phone(
+                    phone=phone_number, cars_url=CARS_URL
+                )
                 log.info(f"[{lang}] lookup: found_cust={found_cust} found_appt={found_appt}")
             except Exception as e:
                 log.warning(f"[{lang}] lookup failed: {e}")
 
-        # (optional test overrides)
-        # found_cust = False
-        # found_appt = False
-
-        # Build session (remove ElevenLabs 'speed' to avoid invalid_voice_settings)
+        # Build session
         session = AgentSession(
             llm=openai.LLM(model=LLM_MODEL),
             stt=deepgram.STT(model="nova-3", language=DEEPGRAM_LANG[lang], interim_results=True),
@@ -414,7 +418,7 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
                 voice_settings=VoiceSettings(
                     similarity_boost=0.75,
                     stability=0.5,
-                    style=0.5,             # if your SDK needs style_exaggeration, rename here
+                    style=0.5,
                     use_speaker_boost=True
                 ),
             ),
@@ -437,6 +441,7 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
             lang=lang,
             supervisor=supervisor,
         )
+        agent.lang = lang  # explicit
         if phone_number:
             agent._sip_participant_identity = f'sip_{phone_number}'
 
@@ -474,12 +479,16 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
 
         register_transcript_writer(ctx, session, agent)
 
-        # Join/connect BEFORE signaling READY, so the supervisor only proceeds when we’re truly live
-        await start_recording(ctx, agent)  # if this requires the room, move it after session.start
+        # Start recording (safe to ignore failure pre-join)
+        try:
+            await start_recording(ctx, agent)
+        except Exception as e:
+            log.debug(f"[{lang}] start_recording pre-join failed (ok): {e}")
 
+        # Join room
         await session.start(
             agent=agent,
-            room=ctx.room,   # ctx.room should now reference the same room_name
+            room=ctx.room,
             room_input_options=RoomInputOptions(
                 noise_cancellation=noise_cancellation.BVCTelephony(),
                 close_on_disconnect=False
@@ -498,28 +507,35 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
         except Exception as e:
             log.warning(f"[{lang}] session update failed: {e}")
 
-        # Now that we’re connected & configured, signal READY
-        _signal_ready(room_name, lang)
+        # --- READY SIGNAL via HANDOFF_ROOM (robust) ---
+        from pathlib import Path
+        env_room = os.getenv("HANDOFF_ROOM") or room_name
+        ready_path = Path(f"/tmp/{env_room}-READY-{lang}")
+        log.info(f"[{lang}] touching READY flag: {ready_path}")
 
-        # Connect transport if required by your framework (some templates need this earlier)
+        ok = False
+        for i in range(5):
+            try:
+                ready_path.touch(exist_ok=True)
+                if ready_path.exists():
+                    ok = True
+                    break
+            except Exception as e:
+                log.warning(f"[{lang}] READY touch failed (attempt {i+1}): {e}")
+            await asyncio.sleep(0.05)
+
+        if not ok:
+            log.error(f"[{lang}] FAILED to create READY flag at {ready_path}")
+        else:
+            log.info(f"[{lang}] READY flag created")
+
+        # Ensure transport connected (idempotent)
         try:
             await ctx.connect()
         except Exception as e:
             log.warning(f"[{lang}] ctx.connect failed or already connected: {e}")
 
-
-        #Play beeps before connection is completed
-        try:
-            await agent.play_beeps(ctx.room, count=2, freq=1000, duration=0.15, gap=0.15, volume=0.4)
-        except Exception as e:
-            log.warning(f"[{lang}] beep playback failed: {e}")
-
-
-        # Optional background
-        try:
-            await agent.start_background(ctx.room, "office.mp3")
-        except Exception as e:
-            log.warning(f"[{lang}] start_background failed: {e}")
+        # No child-side beeps. EN plays beeps during handoff.
 
         # Greet
         greet_text, next_state = build_dynamic_greeting_and_next(agent, lang)
@@ -532,9 +548,8 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
         await agent.say(greet_text)
 
     finally:
-        # release singleflight exactly once
-        _release_room_lock(room_name)
-
+        if acquired_lock:
+            _release_room_lock(room_name)
 
 def _attach_common_handlers(session: "AgentSession", agent, tag: str):
     @session.on("transcription")
@@ -569,13 +584,16 @@ def _attach_common_handlers(session: "AgentSession", agent, tag: str):
 
     @session.on("agent_false_interruption")
     def _on_agent_false_interruption(ev: AgentFalseInterruptionEvent):
+        # Block any replies if agent is shutting down or handoff suppressed
+        if getattr(agent, "_suppress_responses", False) or getattr(agent, "_is_shutting_down", False):
+            log.info(f"[{tag}] false interruption ignored (handoff or shutdown in progress)")
+            return
+
         log.info(f"[{tag}] false interruption → resume")
-        session.generate_reply(instructions=ev.extra_instructions or NOT_GIVEN)
-
-
-
-
-
+        try:
+            session.generate_reply(instructions=ev.extra_instructions or NOT_GIVEN)
+        except Exception as e:
+            log.warning(f"[{tag}] failed to resume after false interruption: {e}")
 
 
 # Extract phone number from room name

@@ -1,4 +1,4 @@
-from .app_common import normalize_lang
+from .agent_common import normalize_lang
 import asyncio, json, os, sys
 from pathlib import Path
 from typing import Optional

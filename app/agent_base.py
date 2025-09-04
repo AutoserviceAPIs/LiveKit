@@ -4,7 +4,8 @@
 #   cancel_appointment
 
 # your AutomotiveBookingAssistant base class/logic
-from .app_common import CONFIRM_BY_LANG, normalize_lang
+from .agent_customerdata import CARS_URL
+from .agent_common import CONFIRM_BY_LANG, normalize_lang
 from .agent_supervisor import LanguageSupervisor
 from livekit import agents, rtc, api, agents
 from livekit.agents.metrics import TTSMetrics
@@ -970,7 +971,7 @@ class AutomotiveBookingAssistant(Agent):
                 return False
             
             # Call API to find customer
-            url = self.CARS_URL
+            url = CARS_URL
             params = {"phone": phone_10_digits}
             log.info(f"Calling API: {url} with params: {params}")
             

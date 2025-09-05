@@ -37,6 +37,8 @@ from collections import defaultdict
 log = logging.getLogger("agent_common")
 
 LLM_MODEL = "gpt-4o-mini"
+_CHILD_LOCK_DIR = Path("/tmp/agent_childlocks")
+_CHILD_LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
 #Step 5. Gather mileage
 #- Once transportation captured, Ask what is the mileage
@@ -392,359 +394,60 @@ def _release_room_lock(room_name: str) -> None:
 async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tools=None):
     log.info(f"run_language_agent_entrypoint - lang {lang}")
 
-    # Resolve room from ctx or env (supervisor sets HANDOFF_ROOM)
     room_obj  = getattr(ctx, "room", None)
     room_name = getattr(room_obj, "name", None) or os.getenv("HANDOFF_ROOM") or "unknown_room"
     ctx.log_context_fields = {"room": room_name}
 
-    # Normalize language
     _norm = {"en-US": "en", "en": "en", "es": "es", "fr": "fr",
              "French": "fr", "English": "en", "Spanish": "es"}
     lang = _norm.get(lang, lang)
     assert lang in ("en", "es", "fr"), f"Unsupported lang: {lang}"
-    DEEPGRAM_LANG = {"en": "en-US", "es": "es", "fr": "fr"}
 
-    # --- singleflight with handoff bypass ---
+    # --- child/room gating ---
     is_handoff_child = (os.getenv("HANDOFF_LANG") == lang)
-    acquired_lock = False
-    if not is_handoff_child:
+    acquired_room_singleflight = False
+    child_token: str | None = None
+
+    if is_handoff_child:
+        child_token = _acquire_child_lock(room_name, lang, ttl_sec=180)
+        if child_token is None:
+            # SECONDARY child: wait for READY then exit without joining
+            ready_path = Path(f"/tmp/{room_name}-READY-{lang}")
+            log.warning(f"[{lang}] secondary handoff child for {room_name}; waiting for READY then exiting")
+            step, waited, timeout = 0.1, 0.0, 30.0
+            while waited < timeout and not ready_path.exists():
+                await asyncio.sleep(step); waited += step
+            try:
+                await ctx.shutdown()
+            except Exception:
+                pass
+            return
+        else:
+            log.info(f"[{lang}] PRIMARY child lock acquired at {child_token}")
+    else:
         if not _singleflight_room(room_name):
             log.warning(f"[{lang}] duplicate entrypoint for room={room_name}; exiting")
             return
-        acquired_lock = True
-    else:
-        log.info(f"[{lang}] handoff child detected; bypassing singleflight for room={room_name}")
+        acquired_room_singleflight = True
 
+    # ------------------ everything below stays inside this try ------------------
     try:
-        # Lookup seed by phone
-        phone_number = extract_phone_from_room_name(room_name)
-        found_cust = found_appt = False
-        seed = {}
-        if phone_number:
-            try:
-                found_cust, found_appt, seed = await lookup_customer_by_phone(
-                    phone=phone_number, cars_url=CARS_URL
-                )
-                log.info(f"[{lang}] lookup: found_cust={found_cust} found_appt={found_appt}")
-            except Exception as e:
-                log.warning(f"[{lang}] lookup failed: {e}")
+        # >>> YOUR EXISTING BOOT LOGIC <<<
+        # lookup_customer_by_phone(...)
+        # build session/agent
+        # await start_recording(...)
+        # await session.start(...)
+        # touch READY file
+        # await ctx.connect()
+        # greet via await agent.say(...)
 
-        # --------- robust VAD resolution (safe if missing) ----------
-        vad_obj = None
-        try:
-            vad_obj = (getattr(getattr(ctx, "proc", None), "userdata", {}) or {}).get("vad")
-            if not vad_obj:
-                vad_obj = getattr(ctx, "userdata", {}).get("vad")
-        except Exception:
-            vad_obj = None
-        if vad_obj:
-            log.info(f"[{lang}] using provided VAD: {type(vad_obj).__name__}")
-        else:
-            log.info(f"[{lang}] no VAD provided; continuing without explicit VAD")
+        pass  # <-- keep your existing body here
 
-        # Build session
-        session = AgentSession(
-            llm=openai.LLM(model=LLM_MODEL),
-            stt=deepgram.STT(model="nova-3", language=DEEPGRAM_LANG[lang], interim_results=True),
-            tts=elevenlabs.TTS(
-                voice_id=VOICE_BY_LANG[lang],
-                model="eleven_flash_v2_5",
-                voice_settings=VoiceSettings(
-                    similarity_boost=0.75,
-                    stability=0.5,
-                    style=0.5,
-                    use_speaker_boost=True
-                ),
-            ),
-            turn_detection=MultilingualModel(),
-            vad=vad_obj,  # may be None
-            preemptive_generation=False,
-        )
-
-        install_speech_sanitizer(session)
-
-        # --------- TTS sanitizer (times + "o’clock") installed globally ----------
-        def _format_time_for_tts(text: str) -> str:
-            """
-            Normalize & remap times for TTS:
-              - AM mapping:   12 -> 11, else hour -> hour + 1   (e.g., 7:00 AM -> 8 AM, 12:00 AM -> 11 AM)
-              - PM mapping:   12 -> 12, else hour -> hour - 1   (e.g., 1:00 PM -> 12 PM, 12:00 PM -> 12 PM)
-              - Remove 'o'clock' (including unicode apostrophes)
-              - Collapse :00 minutes (keep non-zero minutes)
-              - Normalize AM/PM variants (A.M., a.m., etc.)
-              - Canonicalize 08 AM -> 8 AM
-
-            Examples:
-              "7:00 AM"        -> "8 AM"
-              "12:00 AM"       -> "11 AM"
-              "10:15 AM"       -> "11:15 AM"
-              "1:00 PM"        -> "12 PM"
-              "12:00 PM"       -> "12 PM"
-              "8 o’clock a.m." -> "9 AM"  (AM rule: +1 hour, 8 -> 9)
-            """
-            if not isinstance(text, str):
-                return text
-
-            # --- Patterns ---
-            AM_VARIANT = re.compile(r"\bA\s*\.?\s*M\.?\b", re.IGNORECASE)
-            PM_VARIANT = re.compile(r"\bP\s*\.?\s*M\.?\b", re.IGNORECASE)
-            AM_DOTTED  = re.compile(r"\b(AM|PM)\.", re.IGNORECASE)
-
-            # e.g. "8 o'clock AM", "8 o’clock am", "8 o ’ clock PM"
-            O_CLOCK    = re.compile(r"\b(\d{1,2})\s*o[’']?\s*clock\s*(AM|PM)\b", re.IGNORECASE)
-
-            # e.g. "7:00 AM", "10:15 pm"
-            TIME_AMPM  = re.compile(r"\b(\d{1,2}):(\d{2})\s*(AM|PM)\b", re.IGNORECASE)
-
-            # e.g. "08 AM", "8AM"
-            HOUR_AMPM  = re.compile(r"\b0?(\d{1,2})\s*(AM|PM)\b", re.IGNORECASE)
-
-            # --- Helpers ---
-            def _remap_hour(hour: int, ampm: str, minute: str | None) -> str:
-                """Apply your mapping and format, dropping :00 minutes."""
-                ampm_u = ampm.upper()
-                h = hour
-
-                if ampm_u == "AM":
-                    if h == 12:
-                        h = 11
-                    else:
-                        h = h + 1
-                        if h == 13:
-                            h = 1
-                else:  # PM
-                    if h == 12:
-                        h = 12
-                    else:
-                        h = h - 1
-                        if h == 0:
-                            h = 12
-
-                if minute is None or minute == "00":
-                    return f"{h} {ampm_u}"
-                return f"{h}:{minute} {ampm_u}"
-
-            # --- 1) Normalize AM/PM variants ---
-            text = AM_VARIANT.sub("AM", text)
-            text = PM_VARIANT.sub("PM", text)
-            text = AM_DOTTED.sub(lambda m: m.group(1).upper(), text)
-
-            # --- 2) Handle "o'clock" hour-only cases first (they have no minutes) ---
-            def _fix_oclock(m: re.Match) -> str:
-                hour = int(m.group(1))
-                ampm = m.group(2)
-                return _remap_hour(hour, ampm, minute=None)
-            text = O_CLOCK.sub(_fix_oclock, text)
-
-            # --- 3) Handle hh:mm AM/PM (drop :00 after mapping; keep non-zero minutes) ---
-            def _fix_hhmm(m: re.Match) -> str:
-                hour = int(m.group(1))
-                minute = m.group(2)
-                ampm = m.group(3)
-                return _remap_hour(hour, ampm, minute)
-            text = TIME_AMPM.sub(_fix_hhmm, text)
-
-            # --- 4) Handle bare hour + AM/PM (08 AM, 8AM) last, so we don't double-convert ---
-            def _fix_hour(m: re.Match) -> str:
-                hour = int(m.group(1))
-                ampm = m.group(2)
-                return _remap_hour(hour, ampm, minute=None)
-            text = HOUR_AMPM.sub(_fix_hour, text)
-
-            # --- 5) Tidy spaces ---
-            text = re.sub(r"[ \t]{2,}", " ", text).strip()
-            return text
-
-
-        def _install_tts_sanitizer(sess):
-            if getattr(sess, "_tts_sanitizer_installed", False):
-                return
-            sess._tts_sanitizer_installed = True
-
-            def _sanitize_payload(p):
-                if isinstance(p, str):
-                    return _format_time_for_tts(p)
-                if isinstance(p, dict):
-                    if isinstance(p.get("instructions"), str):
-                        p = dict(p)
-                        p["instructions"] = _format_time_for_tts(p["instructions"])
-                    r = p.get("response")
-                    if isinstance(r, dict) and isinstance(r.get("instructions"), str):
-                        p = dict(p)
-                        rr = dict(r); rr["instructions"] = _format_time_for_tts(rr["instructions"])
-                        p["response"] = rr
-                return p
-
-            # session.update
-            if hasattr(sess, "update") and callable(sess.update):
-                _orig_update = sess.update
-                async def _patched_update(payload=None, **kw):
-                    payload = _sanitize_payload(payload)
-                    res = await _orig_update(payload, **kw)
-                    # re-wrap response.create if SDK swaps it
-                    resp_obj = getattr(sess, "response", None)
-                    if resp_obj and hasattr(resp_obj, "create") and not getattr(resp_obj, "_tts_sanitizer_wrapped", False):
-                        _wrap_response_create(sess)
-                    return res
-                sess.update = _patched_update  # type: ignore
-
-            # session.say
-            if hasattr(sess, "say") and callable(sess.say):
-                _orig_say = sess.say
-                async def _patched_say(text):
-                    return await _orig_say(_format_time_for_tts(text))
-                sess.say = _patched_say  # type: ignore
-
-            # session.generate_reply
-            if hasattr(sess, "generate_reply") and callable(sess.generate_reply):
-                _orig_gen = sess.generate_reply
-                async def _patched_gen(*args, **kw):
-                    if args and isinstance(args[0], str):
-                        args = (_format_time_for_tts(args[0]), *args[1:])
-                    if "instructions" in kw and isinstance(kw["instructions"], str):
-                        kw = dict(kw); kw["instructions"] = _format_time_for_tts(kw["instructions"])
-                    return await _orig_gen(*args, **kw)
-                sess.generate_reply = _patched_gen  # type: ignore
-
-            # response.create
-            def _wrap_response_create(s):
-                robj = getattr(s, "response", None)
-                if not robj or getattr(robj, "_tts_sanitizer_wrapped", False):
-                    return
-                _orig = robj.create
-                async def _patched_create(payload):
-                    return await _orig(_sanitize_payload(payload))
-                robj.create = _patched_create  # type: ignore
-                robj._tts_sanitizer_wrapped = True
-
-            if getattr(sess, "response", None) and hasattr(sess.response, "create"):
-                _wrap_response_create(sess)
-
-        _install_tts_sanitizer(session)
-        # --------- end sanitizer ----------
-
-        # Choose prompt
-        final_prompt = choose_prompt_by_flags(lang, found_cust, found_appt)
-        if found_appt:
-            final_prompt = FOUND_APPT_PROMPT
-        log.info(f"final_prompt = {final_prompt}")
-
-        # Build agent
-        from .agent_base import AutomotiveBookingAssistant
-        agent = AutomotiveBookingAssistant(
-            session, ctx, None,
-            instructions=final_prompt,
-            lang=lang,
-            supervisor=supervisor,
-        )
-        agent.lang = lang  # explicit
-        if phone_number:
-            agent._sip_participant_identity = f'sip_{phone_number}'
-            agent.customer_data["phone"] = phone_number
-
-        # Seed state
-        if seed:
-            agent.customer_data.update(seed)
-            if found_appt and hasattr(agent, "set_current_state"):
-                agent.set_current_state("cancel reschedule")
-            elif found_cust and hasattr(agent, "set_current_state"):
-                agent.set_current_state("get service")
-            elif hasattr(agent, "set_current_state"):
-                agent.set_current_state("get name")
-
-        # Handlers/metrics/transcript
-        _attach_common_handlers(session, agent, tag=lang.upper())
-        usage_collector = metrics.UsageCollector()
-
-        @session.on("metrics_collected")
-        def _on_metrics_collected(ev: MetricsCollectedEvent):
-            metrics.log_metrics(ev.metrics)
-            usage_collector.collect(ev.metrics)
-            if getattr(agent, "appointment_created", False) and isinstance(ev.metrics, TTSMetrics):
-                dur = getattr(ev.metrics, "audio_duration", 0) or 0
-                if dur > 0:
-                    asyncio.create_task(agent.delayed_hangup(dur + 0.5))
-            if isinstance(ev.metrics, TTSMetrics):
-                dur = getattr(ev.metrics, "audio_duration", 0) or 0
-                if dur > 0:
-                    asyncio.create_task(agent.delayed_timeout_start(dur))
-
-        async def log_usage():
-            summary = usage_collector.get_summary()
-            log.info(f"[{lang}] Usage summary: {summary}")
-        ctx.add_shutdown_callback(log_usage)
-
-        register_transcript_writer(ctx, session, agent)
-
-        # Start recording (safe to ignore failure pre-join)
-        try:
-            await start_recording(ctx, agent)
-        except Exception as e:
-            log.debug(f"[{lang}] start_recording pre-join failed (ok): {e}")
-
-        # Join room
-        await session.start(
-            agent=agent,
-            room=ctx.room,
-            room_input_options=RoomInputOptions(
-                noise_cancellation=noise_cancellation.BVCTelephony(),
-                close_on_disconnect=False
-            ),
-        )
-
-        # Push tools/prompt after start
-        try:
-            upd = {"instructions": final_prompt}
-            if tools:
-                upd.update({"tools": tools, "tool_choice": "auto"})
-            if hasattr(session, "update"):
-                await session.update(upd)
-            elif hasattr(session, "response") and hasattr(session.response, "session_update"):
-                await session.response.session_update(upd)
-        except Exception as e:
-            log.warning(f"[{lang}] session update failed: {e}")
-
-        # --- READY SIGNAL via HANDOFF_ROOM (robust) ---
-        from pathlib import Path
-        env_room = os.getenv("HANDOFF_ROOM") or room_name
-        ready_path = Path(f"/tmp/{env_room}-READY-{lang}")
-        log.info(f"[{lang}] touching READY flag: {ready_path}")
-
-        ok = False
-        for _ in range(5):
-            try:
-                ready_path.touch(exist_ok=True)
-                if ready_path.exists():
-                    ok = True
-                    break
-            except Exception as e:
-                log.warning(f"[{lang}] READY touch failed: {e}")
-            await asyncio.sleep(0.05)
-
-        if not ok:
-            log.error(f"[{lang}] FAILED to create READY flag at {ready_path}")
-        else:
-            log.info(f"[{lang}] READY flag created")
-
-        # Ensure transport connected (idempotent)
-        try:
-            await ctx.connect()
-        except Exception as e:
-            log.warning(f"[{lang}] ctx.connect failed or already connected: {e}")
-
-        # Greet (times already sanitized by the global wrapper)
-        greet_text, next_state = build_dynamic_greeting_and_next(agent, lang)
-        if hasattr(agent, "set_current_state"):
-            agent.set_current_state(next_state)
-        else:
-            agent.state["progress"] = next_state
-
-        log.info(f"run_language_agent_entrypoint - Greet text: {greet_text}")
-        await agent.say(greet_text)
-
+    # ------------------ ALWAYS release locks here ------------------
     finally:
-        if acquired_lock:
+        if acquired_room_singleflight:
             _release_room_lock(room_name)
+        _release_child_lock(child_token)
 
 
 def _attach_common_handlers(session: "AgentSession", agent, tag: str):
@@ -767,7 +470,23 @@ def _attach_common_handlers(session: "AgentSession", agent, tag: str):
 
     @session.on("conversation_item_added")
     def _on_conversation_item_added(ev):
-        log.info(f"[{tag}] item: {ev.item.type} - {ev.item.content[0]}...")
+        # Some SDKs emit assistant items post-tool by default; drop them if we're suppressing.
+        try:
+            it = ev.item
+            role = getattr(it, "role", None)
+            content0 = None
+            try:
+                content0 = it.content[0] if getattr(it, "content", None) else None
+            except Exception:
+                pass
+
+            if getattr(agent, "_suppress_responses", False) and role in ("assistant", "agent"):
+                log.info(f"[{tag}] suppressed assistant item after handoff")
+                return
+
+            log.info(f"[{tag}] item: {getattr(it, 'type', '?')} - {content0}...")
+        except Exception:
+            log.info(f"[{tag}] item: {getattr(ev, 'item', None)}")
 
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(ev):
@@ -1282,3 +1001,97 @@ def install_speech_sanitizer(session):
         async def _send_json(payload):
             return await orig(_sanitize_any(payload))
         ws.send_json = _send_json  # type: ignore
+
+
+def _child_lock_path(room: str, lang: str) -> Path:
+    safe_room = room.replace("/", "_")
+    return _CHILD_LOCK_DIR / f"{safe_room}-{lang}.lock"
+
+def _is_pid_alive(pid: int) -> bool:
+    try:
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+def _acquire_child_lock(room: str, lang: str, *, ttl_sec: int = 180) -> str | None:
+    """
+    Try to become the PRIMARY child. Returns the lockfile path (token) if acquired,
+    else None if another healthy child already holds it.
+    Safely rescues stale locks (dead PID or lock older than TTL).
+    """
+    p = _child_lock_path(room, lang)
+    now = time.time()
+
+    # Try exclusive create; write our PID inside
+    try:
+        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, str(os.getpid()).encode("utf-8"))
+        finally:
+            os.close(fd)
+        return str(p)
+    except FileExistsError:
+        # Check for stale/dead PID or TTL expiry
+        try:
+            st = p.stat()
+            # TTL rescue
+            if now - st.st_mtime > ttl_sec:
+                os.unlink(p)
+                return _acquire_child_lock(room, lang, ttl_sec=ttl_sec)
+
+            # PID liveness rescue
+            try:
+                raw = p.read_text().strip()
+                pid = int(raw) if raw else 0
+            except Exception:
+                pid = 0
+
+            if not _is_pid_alive(pid):
+                # lock is stale → take it over
+                try:
+                    os.unlink(p)
+                except FileNotFoundError:
+                    pass
+                return _acquire_child_lock(room, lang, ttl_sec=ttl_sec)
+        except FileNotFoundError:
+            # Race: vanished → retry once
+            return _acquire_child_lock(room, lang, ttl_sec=ttl_sec)
+        # Someone healthy holds the lock → we’re SECONDARY
+        return None
+
+def _release_child_lock(token: str | None):
+    if not token:
+        return
+    try:
+        os.unlink(token)
+    except FileNotFoundError:
+        pass
+
+def _cleanup_stale_child_lock(room: str, lang: str, *, ttl_sec: int = 180):
+    """
+    Supervisor-side best-effort cleanup before spawning a new child.
+    If the lock holder PID is dead or the file is older than TTL, remove it.
+    """
+    p = _child_lock_path(room, lang)
+    if not p.exists():
+        return
+    try:
+        raw = p.read_text().strip()
+        pid = int(raw) if raw else 0
+    except Exception:
+        pid = 0
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        return
+    if (not _is_pid_alive(pid)) or (time.time() - st.st_mtime > ttl_sec):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+
+def _ready_flag_path(room: str, lang: str) -> Path:
+    return Path(f"/tmp/{room}-READY-{lang}")

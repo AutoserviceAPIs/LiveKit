@@ -1,46 +1,37 @@
 # app/agent_fr.py
 import os, sys, logging
+from livekit.agents import WorkerOptions, JobContext
+from livekit.agents.cli import cli
+from .agent_common import run_language_agent_entrypoint, _acquire_child_lock, _release_child_lock
 
-# Make stdout unbuffered so child logs show up immediately.
-os.environ.setdefault("PYTHONUNBUFFERED", "1")
-
-from livekit.agents import WorkerOptions, JobContext         # <-- correct imports
-from livekit.agents.cli import cli                           # <-- cli comes from .cli
-from .agent_common import run_language_agent_entrypoint       # <-- async function
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s %(name)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
 log = logging.getLogger("agent_fr")
 
 async def entrypoint(ctx: JobContext):
-    """
-    The ONLY entrypoint for the FR worker. Must be async and awaited by the runtime.
-    """
     log.info("***********FRENCH AGENT***************")
 
-    # Ensure HANDOFF_* are present for supervisor handoff path.
     room_name = getattr(getattr(ctx, "room", None), "name", None)
     env_room = os.environ.get("HANDOFF_ROOM") or room_name or "unknown_room"
     os.environ["HANDOFF_ROOM"] = env_room
     os.environ.setdefault("HANDOFF_LANG", "fr")
 
-    log.info(
-        "[fr] entrypoint starting: HANDOFF_ROOM=%s HANDOFF_LANG=%s",
-        os.environ.get("HANDOFF_ROOM"),
-        os.environ.get("HANDOFF_LANG"),
-    )
+    # Prevent multiple FR children for the same room
+    lock = _acquire_child_lock(env_room, "fr")
+    if lock is None:
+        log.warning("[fr] another FR child already active for room=%s — exiting early", env_room)
+        return
 
-    # IMPORTANT: await the shared runner (it's async)
-    await run_language_agent_entrypoint(ctx, "fr")
-
-# Keep this file minimal: do NOT import or define any `prewarm` here unless you really need it.
-# If you DO need a prewarm, it must be a SYNC function:  def prewarm(proc): ...
+    try:
+        log.info("[fr] entrypoint starting: HANDOFF_ROOM=%s HANDOFF_LANG=%s", env_room, os.environ.get("HANDOFF_LANG"))
+        await run_language_agent_entrypoint(ctx, "fr")
+    finally:
+        _release_child_lock(lock)
 
 if __name__ == "__main__":
-    # Pass ONLY the entrypoint; omit prewarm entirely unless required/supported by your SDK version.
-    # Passing prewarm_fnc=None can trip some versions; just omit it.
-    assert callable(entrypoint), "entrypoint is not callable"
+    # Auto-fallback to `connect --room` if called without subcommand
+    if len(sys.argv) == 1:
+        room = os.environ.get("HANDOFF_ROOM", "unknown_room")
+        sys.argv += ["connect", "--room", room]
+        print(f"[FR] no subcommand; defaulting to: {sys.argv!r}", flush=True)
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

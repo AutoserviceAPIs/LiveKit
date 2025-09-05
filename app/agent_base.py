@@ -6,7 +6,7 @@
 # your AutomotiveBookingAssistant base class/logic
 from .agent_customerdata import CARS_URL
 from .agent_common import CONFIRM_BY_LANG, LANG_MAP, normalize_lang, play_beeps
-from .agent_supervisor import LanguageSupervisor, OneShotSupervisor
+from .agent_supervisor import Supervisor
 from livekit import agents, rtc, api, agents
 from livekit.agents.metrics import TTSMetrics
 from livekit.protocol import room as room_msgs  # ✅ protocol types live here
@@ -786,7 +786,7 @@ class AutomotiveBookingAssistant(Agent):
         if getattr(self, "_handoff_inflight", False):
             return "BUSY"
 
-        canon = normalize_lang(lang)  # "Spanish"/"es-ES" -> "es"
+        canon = normalize_lang(lang)  # "French"/"fr-FR" -> "fr"
         log.info(f"set_language lang = {canon}")
 
         SUPPORTED = {"es", "fr", "hi", "vi"}
@@ -797,34 +797,31 @@ class AutomotiveBookingAssistant(Agent):
         if canon == getattr(self, "lang", "en"):
             return "OK"
 
-        # speak confirmation (in requested language if present)
+        # Confirmation (let this one play)
         key = LANG_MAP.get(lang, lang)
         confirm_line = CONFIRM_BY_LANG.get(key) or CONFIRM_BY_LANG.get("en", "Switching language…")
         await self.say(confirm_line)
 
         self._handoff_inflight = True
         self._is_shutting_down = True
-
-        stop_evt = None
-        beep_task = None
-
         try:
+            # stop background & timers
             try: self.cancel_timeout()
             except Exception: pass
-
             try:
                 if hasattr(self, "stop_background"):
                     await self.stop_background()
             except Exception: pass
 
+            # ensure supervisor
             if not getattr(self, "supervisor", None):
                 room = getattr(getattr(self._ctx, "room", None), "name", None)
                 if not room:
                     self._is_shutting_down = False
                     return "ERR_NO_SUPERVISOR"
-                # a touch more lenient
-                self.supervisor = OneShotSupervisor(room=room, ready_timeout=18.0)
+                self.supervisor = Supervisor(room=room, ready_timeout=18.0)
 
+            # snapshot
             try:
                 snapshot = self.snapshot_state()
             except Exception:
@@ -834,83 +831,101 @@ class AutomotiveBookingAssistant(Agent):
                     "available_slots": getattr(self, "available_slots", []),
                 }
 
-            # mute this agent immediately
-            self._suppress_responses = True
-            try: await self.session.update(input_audio_enabled=False)
-            except Exception: pass
+            # --------- HARD MUTE EN (blocks late LLM replies) ----------
+            self._suppress_responses = True  # our own guard used in handlers/say()
 
-            # cancel any in-flight responses
-            for attr in ("cancel_current_response", "cancel_responses", "cancel_all_responses"):
-                fn = getattr(self.session, attr, None)
-                if callable(fn):
+            # Best-effort: disable input & output & kill any queued response
+            async def _mute_session():
+                # 1) disable user input mic → EN won't react
+                try: await self.session.update(input_audio_enabled=False)
+                except Exception: pass
+
+                # 2) stop output immediately (SDKs differ; try all patterns)
+                payloads = (
+                    {"output_audio_enabled": False},
+                    {"modalities": []},
+                    {"response": {"instructions": "", "stop": True}},
+                )
+                for p in payloads:
                     try:
-                        await fn()
-                        break
+                        await self.session.update(p)
                     except Exception:
                         pass
 
-            # progress beeps while waiting
-            room_for_audio = getattr(self.session, "room", None) or getattr(self._ctx, "room", None)
-            stop_evt = asyncio.Event()
+                # 3) cancel any in-flight responses
+                for attr in ("cancel_current_response", "cancel_responses", "cancel_all_responses"):
+                    fn = getattr(self.session, attr, None)
+                    if callable(fn):
+                        try: await fn()
+                        except Exception: pass
 
+            await _mute_session()
+            # -----------------------------------------------------------
+
+            # (Optional) soft progress beeps while waiting (safe if you’ve added play_beeps)
+            # Comment out if you don't want beeps.
+            stop_evt = asyncio.Event()
             async def _handoff_beeper():
                 try:
                     while not stop_evt.is_set():
                         try:
-                            if room_for_audio and hasattr(self, "play_beeps"):
-                                await self.play_beeps(room_for_audio, count=2, freq=1000, duration=0.12, gap=0.12, volume=0.38)
-                        except Exception as e:
-                            log.debug(f"[HANDOFF] beeper suppressed: {e}")
+                            if hasattr(self, "play_beeps"):
+                                room_for_audio = getattr(self.session, "room", None) or getattr(self._ctx, "room", None)
+                                if room_for_audio:
+                                    await self.play_beeps(room_for_audio, count=2, freq=1000, duration=0.12, gap=0.12, volume=0.38)
+                        except Exception:
                             await asyncio.sleep(0.3)
                         try:
                             await asyncio.wait_for(stop_evt.wait(), timeout=0.35)
                         except asyncio.TimeoutError:
                             pass
-                except Exception as e:
-                    log.warning(f"[HANDOFF] beeper error: {e}")
-
+                except Exception:
+                    pass
             beep_task = asyncio.create_task(_handoff_beeper())
 
-            # spawn child and wait READY
+            # spawn child & wait READY
             log.info(f"[HANDOFF] about to call supervisor.handoff(lang={canon}) supervisor={type(self.supervisor).__name__} id={id(self.supervisor)}")
             try:
                 await self.supervisor.handoff(canon, state_snapshot=snapshot)
                 log.info("[HANDOFF] supervisor.handoff() returned READY")
             except TimeoutError:
-                log.warning(f"[HANDOFF] timeout waiting READY for {canon}")
-                # treat as pending (keep EN muted, no apology)
+                if not stop_evt.is_set(): stop_evt.set()
+                try: await asyncio.wait_for(beep_task, timeout=0.3)
+                except Exception: beep_task.cancel()
                 return "PENDING"
             except RuntimeError as e:
-                # e.g., "child exited BEFORE READY" → treat like pending so we don't interrupt UX
+                if not stop_evt.is_set(): stop_evt.set()
+                try: await asyncio.wait_for(beep_task, timeout=0.3)
+                except Exception: beep_task.cancel()
                 log.warning(f"[HANDOFF] child error treated as PENDING: {e}")
                 return "PENDING"
             except Exception as e:
-                log.exception(f"[HANDOFF] handoff() raised: {e}")
-                # restore minimal ability to speak apology
+                if not stop_evt.is_set(): stop_evt.set()
+                try: await asyncio.wait_for(beep_task, timeout=0.3)
+                except Exception: beep_task.cancel()
+                # allow apology
                 self._is_shutting_down = False
                 try:
                     self._suppress_responses = False
-                    await self.session.update(input_audio_enabled=True)
+                    await self.session.update(input_audio_enabled=True, output_audio_enabled=True)
                 except Exception: pass
                 await self.say("I couldn’t switch languages right now. We can continue here or I can transfer you to a person.")
                 return f"ERR_HANDOFF_FAILED:{e}"
             finally:
-                # stop beeps on any path
-                if stop_evt: stop_evt.set()
-                if beep_task:
-                    try:
-                        await asyncio.wait_for(beep_task, timeout=0.3)
-                    except Exception:
-                        beep_task.cancel()
+                if 'stop_evt' in locals() and not stop_evt.is_set():
+                    stop_evt.set()
 
-            # READY → leave the room as EN
-            try: await self.session.close()
-            except Exception: pass
+            # READY → **leave the room** completely as EN
+            try:
+                await self.session.close()
+            except Exception:
+                pass
 
             return "OK"
 
         finally:
             self._handoff_inflight = False
+
 
 
     @function_tool

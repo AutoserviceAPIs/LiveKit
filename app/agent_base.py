@@ -27,6 +27,8 @@ from dotenv import load_dotenv
 
 log = logging.getLogger("agent")
 load_dotenv(".env")
+logging.getLogger("livekit.agents").disabled = True
+logging.getLogger("asyncio").disabled = True
 
 
 class AutomotiveBookingAssistant(Agent):

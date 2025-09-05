@@ -26,7 +26,7 @@ from livekit.plugins.elevenlabs import VoiceSettings
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.protocol import room as room_msgs  # ✅ protocol types live here
 from livekit.protocol.sip import TransferSIPParticipantRequest
-import logging, aiohttp, json, os, asyncio, re, time, math
+import logging, aiohttp, json, os, asyncio, re, time, math, sys
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
@@ -35,10 +35,21 @@ from pathlib import Path
 from collections import defaultdict
 
 log = logging.getLogger("agent_common")
+logging.getLogger("livekit.agents").disabled = True
+logging.getLogger("asyncio").disabled = True
 
 LLM_MODEL = "gpt-4o-mini"
 _CHILD_LOCK_DIR = Path("/tmp/agent_childlocks")
 _CHILD_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+NOISY = (
+    "livekit.agents",
+    "livekit",               # catch any parent logger too
+    "openai",
+    "openai._base_client",
+    "httpx",
+    "httpcore",
+    "httpcore.http11",
+)
 
 #Step 5. Gather mileage
 #- Once transportation captured, Ask what is the mileage
@@ -394,24 +405,40 @@ def _release_room_lock(room_name: str) -> None:
 async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tools=None):
     log.info(f"run_language_agent_entrypoint - lang {lang}")
 
+    # 0) connect EARLY so ctx.room is valid
+    try:
+        await ctx.connect()
+    except Exception as e:
+        log.exception("job_ctx.connect() failed: %s", e)
+        # clean shutdown to avoid LK warning
+        try:
+            await ctx.shutdown()
+        finally:
+            return
+
+    # 1) resolve room + logging context
     room_obj  = getattr(ctx, "room", None)
     room_name = getattr(room_obj, "name", None) or os.getenv("HANDOFF_ROOM") or "unknown_room"
     ctx.log_context_fields = {"room": room_name}
 
+    # 2) normalize language
     _norm = {"en-US": "en", "en": "en", "es": "es", "fr": "fr",
              "French": "fr", "English": "en", "Spanish": "es"}
     lang = _norm.get(lang, lang)
     assert lang in ("en", "es", "fr"), f"Unsupported lang: {lang}"
+    DEEPGRAM_LANG = {"en": "en-US", "es": "es", "fr": "fr"}
 
-    # --- child/room gating ---
+    # 3) child/room gating
+    from pathlib import Path
     is_handoff_child = (os.getenv("HANDOFF_LANG") == lang)
     acquired_room_singleflight = False
     child_token: str | None = None
 
     if is_handoff_child:
+        # cross-proc dedupe: only one primary child should proceed
         child_token = _acquire_child_lock(room_name, lang, ttl_sec=180)
         if child_token is None:
-            # SECONDARY child: wait for READY then exit without joining
+            # secondary child: wait for READY then exit cleanly
             ready_path = Path(f"/tmp/{room_name}-READY-{lang}")
             log.warning(f"[{lang}] secondary handoff child for {room_name}; waiting for READY then exiting")
             step, waited, timeout = 0.1, 0.0, 30.0
@@ -419,35 +446,181 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
                 await asyncio.sleep(step); waited += step
             try:
                 await ctx.shutdown()
-            except Exception:
-                pass
-            return
+            finally:
+                return
         else:
             log.info(f"[{lang}] PRIMARY child lock acquired at {child_token}")
     else:
         if not _singleflight_room(room_name):
             log.warning(f"[{lang}] duplicate entrypoint for room={room_name}; exiting")
-            return
+            # clean shutdown to avoid LK warning
+            try:
+                await ctx.shutdown()
+            finally:
+                return
         acquired_room_singleflight = True
 
-    # ------------------ everything below stays inside this try ------------------
+    # 4) main boot
     try:
-        # >>> YOUR EXISTING BOOT LOGIC <<<
-        # lookup_customer_by_phone(...)
-        # build session/agent
-        # await start_recording(...)
-        # await session.start(...)
-        # touch READY file
-        # await ctx.connect()
-        # greet via await agent.say(...)
+        # lookup seed by phone (best-effort)
+        phone_number = extract_phone_from_room_name(room_name)
+        found_cust = found_appt = False
+        seed = {}
+        if phone_number:
+            try:
+                found_cust, found_appt, seed = await lookup_customer_by_phone(
+                    phone=phone_number, cars_url=CARS_URL
+                )
+                log.info(f"[{lang}] lookup: found_cust={found_cust} found_appt={found_appt}")
+            except Exception as e:
+                log.warning(f"[{lang}] lookup failed: {e}")
 
-        pass  # <-- keep your existing body here
+        # VAD resolution (safe if missing)
+        vad_obj = None
+        try:
+            vad_obj = (getattr(getattr(ctx, "proc", None), "userdata", {}) or {}).get("vad") \
+                      or getattr(ctx, "userdata", {}).get("vad")
+        except Exception:
+            vad_obj = None
+        if vad_obj:
+            log.info(f"[{lang}] using provided VAD: {type(vad_obj).__name__}")
+        else:
+            log.info(f"[{lang}] no VAD provided; continuing without explicit VAD")
 
-    # ------------------ ALWAYS release locks here ------------------
+        # session
+        session = AgentSession(
+            llm=openai.LLM(model=LLM_MODEL),
+            stt=deepgram.STT(model="nova-3", language=DEEPGRAM_LANG[lang], interim_results=True),
+            tts=elevenlabs.TTS(
+                voice_id=VOICE_BY_LANG[lang],
+                model="eleven_flash_v2_5",
+                voice_settings=VoiceSettings(
+                    similarity_boost=0.75,
+                    stability=0.5,
+                    style=0.5,
+                    use_speaker_boost=True
+                ),
+            ),
+            turn_detection=MultilingualModel(),
+            vad=vad_obj,
+            preemptive_generation=False,
+        )
+
+        # (optional) install your TTS sanitizer hook if you have one
+        try:
+            install_speech_sanitizer(session)  # noop if not defined
+        except Exception:
+            pass
+
+        # prompt selection
+        final_prompt = choose_prompt_by_flags(lang, found_cust, found_appt)
+        if found_appt:
+            final_prompt = FOUND_APPT_PROMPT
+        #log.info(f"final_prompt = {final_prompt}")
+
+        # agent
+        from .agent_base import AutomotiveBookingAssistant
+        agent = AutomotiveBookingAssistant(
+            session, ctx, None,
+            instructions=final_prompt,
+            lang=lang,
+            supervisor=supervisor,
+        )
+        agent.lang = lang
+        log.info(f"AGENT FOR {lang} IS CONSTRUCTED")
+        if phone_number:
+            agent._sip_participant_identity = f'sip_{phone_number}'
+            agent.customer_data["phone"] = phone_number
+
+        if seed:
+            agent.customer_data.update(seed)
+            if found_appt and hasattr(agent, "set_current_state"):
+                agent.set_current_state("cancel reschedule")
+            elif found_cust and hasattr(agent, "set_current_state"):
+                agent.set_current_state("get service")
+            elif hasattr(agent, "set_current_state"):
+                agent.set_current_state("get name")
+
+        # handlers/metrics/transcript
+        _attach_common_handlers(session, agent, tag=lang.upper())
+        usage_collector = metrics.UsageCollector()
+
+        @session.on("metrics_collected")
+        def _on_metrics_collected(ev: MetricsCollectedEvent):
+            metrics.log_metrics(ev.metrics)
+            usage_collector.collect(ev.metrics)
+            if getattr(agent, "appointment_created", False) and isinstance(ev.metrics, TTSMetrics):
+                dur = getattr(ev.metrics, "audio_duration", 0) or 0
+                if dur > 0:
+                    asyncio.create_task(agent.delayed_hangup(dur + 0.5))
+            if isinstance(ev.metrics, TTSMetrics):
+                dur = getattr(ev.metrics, "audio_duration", 0) or 0
+                if dur > 0:
+                    asyncio.create_task(agent.delayed_timeout_start(dur))
+
+        async def log_usage():
+            summary = usage_collector.get_summary()
+            log.info(f"[{lang}] Usage summary: {summary}")
+        ctx.add_shutdown_callback(log_usage)
+
+        register_transcript_writer(ctx, session, agent)
+
+        # start recording (ignore pre-join failures)
+        try:
+            await start_recording(ctx, agent)
+        except Exception as e:
+            log.debug(f"[{lang}] start_recording pre-join failed (ok): {e}")
+
+        # join the room (ctx.room was created by ctx.connect above)
+        await session.start(
+            agent=agent,
+            room=ctx.room,
+            room_input_options=RoomInputOptions(
+                noise_cancellation=noise_cancellation.BVCTelephony(),
+                close_on_disconnect=False
+            ),
+        )
+
+        # post-start session update (prompt/tools)
+        try:
+            upd = {"instructions": final_prompt}
+            if tools:
+                upd.update({"tools": tools, "tool_choice": "auto"})
+            if hasattr(session, "update"):
+                await session.update(upd)
+            elif hasattr(session, "response") and hasattr(session.response, "session_update"):
+                await session.response.session_update(upd)
+        except Exception as e:
+            log.warning(f"[{lang}] session update failed: {e}")
+
+        # signal READY for handoff children
+        ready_path = Path(f"/tmp/{room_name}-READY-{lang}")
+        try:
+            ready_path.touch(exist_ok=True)
+            log.info(f"[{lang}] READY flag created at {ready_path}")
+        except Exception as e:
+            log.warning(f"[{lang}] READY touch failed: {e}")
+
+        # greet
+        greet_text, next_state = build_dynamic_greeting_and_next(agent, lang)
+        if hasattr(agent, "set_current_state"):
+            agent.set_current_state(next_state)
+        else:
+            agent.state["progress"] = next_state
+        log.info(f"run_language_agent_entrypoint - Greet text: {greet_text}")
+        await agent.say(greet_text)
+
+        # keep the job alive until the room disconnects
+        await ctx.wait_until_disconnected()
+
     finally:
+        # ALWAYS release locks
         if acquired_room_singleflight:
             _release_room_lock(room_name)
-        _release_child_lock(child_token)
+        try:
+            _release_child_lock(child_token)
+        except Exception:
+            pass
 
 
 def _attach_common_handlers(session: "AgentSession", agent, tag: str):
@@ -645,10 +818,20 @@ async def start_recording(ctx: JobContext, agent):
 
 def prewarm(proc: JobProcess):
     log.info(f"prewarm")
+    configure_app_logging()
     if "vad" not in proc.userdata:
         proc.userdata["vad"] = silero.VAD.load()
     if "llm" not in proc.userdata:
         proc.userdata["llm"] = openai.LLM(model=LLM_MODEL)
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    # ensure at least one stream handler exists
+    root = logging.getLogger()
+    if not root.handlers:
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s %(name)s - %(message)s"))
+        root.addHandler(h)
+    root.setLevel(logging.INFO)        # keep your own INFO logs
+    quiet_third_party(logging.WARNING) # silence the spammy libs
 
 
 def register_transcript_writer(ctx, session, agent, *,
@@ -1095,3 +1278,32 @@ def _cleanup_stale_child_lock(room: str, lang: str, *, ttl_sec: int = 180):
 
 def _ready_flag_path(room: str, lang: str) -> Path:
     return Path(f"/tmp/{room}-READY-{lang}")
+
+
+def configure_app_logging(level=logging.INFO):
+    root = logging.getLogger()
+
+    # Ensure the root level is at least INFO so child loggers can be seen
+    if root.level > level:
+        root.setLevel(level)
+
+    # Make sure there's at least one stream handler (some setups attach none or file-only)
+    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        h = logging.StreamHandler(sys.stdout)   # stdout so your supervisor/caller can capture it
+        # keep formatting simple; or mirror LK’s JSON later if you want
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s - %(levelname)s %(name)s - %(message)s"
+        ))
+        root.addHandler(h)
+
+    # Turn up your app namespaces explicitly
+    for name in ("agent", "agent_en", "agent_fr", "agent_common", "app"):
+        lg = logging.getLogger(name)
+        lg.setLevel(level)
+        lg.propagate = True   # bubble up to root handler(s)
+
+def quiet_third_party(level=logging.WARNING):
+    for name in NOISY:
+        lg = logging.getLogger(name)
+        lg.setLevel(level)     # e.g., WARNING or ERROR
+        lg.propagate = True    # keep using the root handler

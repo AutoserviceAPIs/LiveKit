@@ -1,55 +1,23 @@
-# app/agent_en.py
-import logging, os, typing as t
-from livekit.agents import JobContext, WorkerOptions, cli
+import logging, asyncio, os, sys
 from .agent_supervisor import Supervisor
+from .agent_base import AutomotiveBookingAssistant
 from .agent_common import run_language_agent_entrypoint, prewarm
+from livekit.agents import JobContext, WorkerOptions, cli
+
 
 log = logging.getLogger("agent_en")
 
-def _resolve_room_name(ctx: JobContext) -> str:
-    """
-    Returns the room name as a plain string.
-    Works whether launched via `connect --room ...` or via env.
-    Handles cases where attributes are Room objects.
-    """
-    # 1) Try job-bound fields first (preferred when using CLI `connect --room`)
-    job = getattr(ctx, "job", None)
-    if job is not None:
-        # Some builds expose job.room_name (str); others expose job.room (str or Room)
-        val = getattr(job, "room_name", None)
-        if isinstance(val, str) and val:
-            return val
-
-        val = getattr(job, "room", None)
-        if isinstance(val, str) and val:
-            return val
-        if getattr(val, "name", None):  # Room object
-            name = getattr(val, "name")
-            if isinstance(name, str) and name:
-                return name
-
-    # 2) If already connected (or partially prepared), ctx.room may exist
-    room_obj = getattr(ctx, "room", None)
-    if getattr(room_obj, "name", None):
-        name = getattr(room_obj, "name")
-        if isinstance(name, str) and name:
-            return name
-
-    # 3) Fallback to env (when launched by your Supervisor)
-    env_room = os.getenv("HANDOFF_ROOM")
-    if env_room:
-        return env_room
-
-    raise RuntimeError("Could not resolve room name (no job.room_name, no job.room/.name, no HANDOFF_ROOM).")
-
-async def entrypoint(ctx: JobContext):
+async def entrypoint(ctx):
+    # Loud banner to confirm EN process is running
     log.info("***********EN AGENT ENTRYPOINT***************")
 
-    room_name = _resolve_room_name(ctx)
-
-    # Export for glue that relies on HANDOFF_* and READY flags
-    os.environ["HANDOFF_ROOM"] = room_name          # <-- guaranteed str now
-    os.environ["HANDOFF_LANG"] = "en"
+    # Make sure child inherits the room name (even if no CLI args)
+    os.environ["HANDOFF_ROOM"] = ctx.room.name
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
-    # One-shot
+    sup = Supervisor(room=ctx.room.name, ready_timeout=18.0)
+    await run_language_agent_entrypoint(ctx, "en", supervisor=sup)
+
+if __name__ == "__main__":
+    from livekit.agents import cli
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="test"))

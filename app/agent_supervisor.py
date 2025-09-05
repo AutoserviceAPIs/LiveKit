@@ -1,14 +1,13 @@
 # agent_supervisor.py
-import asyncio
-import json
-import os
-import sys
+import asyncio, json, os, sys, logging
 from pathlib import Path
 from typing import Optional, Set
 from contextlib import contextmanager, suppress
 
 # import/define these from your codebase
 # from .agent_common import normalize_lang, MODULE_BY_LANG, log
+
+logging.getLogger("asyncio").disabled = True
 
 @contextmanager
 def _room_lang_lock(lock_path: str):

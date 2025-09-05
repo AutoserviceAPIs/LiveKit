@@ -542,7 +542,7 @@ class AutomotiveBookingAssistant(Agent):
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(api_url, json=payload, headers={"Content-Type": "application/json"}) as response:
+                async with session.get(api_url, params=payload, headers={"Content-Type": "application/json"}) as response:
                     if response.status == 200:
                         data = await response.json()
                         log.info(f"Customer info written successfully: {data}")

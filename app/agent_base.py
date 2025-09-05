@@ -1032,6 +1032,7 @@ class AutomotiveBookingAssistant(Agent):
         
         Args:
             preferred_date: Preferred date in YYYY-MM-DD format (optional)
+            preferred_time: Preferred time in HH:MM format (e.g., "17:00" or "7:00 PM") (optional)
         """
         log.info(f"Checking available slots for date: {preferred_date} and time {preferred_time}")
         
@@ -1039,8 +1040,55 @@ class AutomotiveBookingAssistant(Agent):
             # Check if preferred date has available slots
             if preferred_date in self.available_slots:
                 all_slots = self.available_slots[preferred_date]
-                # Limit to maximum 3 time slots
-                slots = all_slots[:3]
+                
+                # Filter slots based on preferred_time if provided
+                if preferred_time:
+                    # Normalize preferred_time format (handle both 17:00 and 7:00 formats)
+                    try:
+                        # Try parsing as 24-hour format first
+                        if ':' in preferred_time and len(preferred_time.split(':')[0]) <= 2:
+                            preferred_time_obj = datetime.strptime(preferred_time, "%H:%M")
+                        else:
+                            # Try parsing as 12-hour format
+                            preferred_time_obj = datetime.strptime(preferred_time, "%I:%M %p")
+                    except ValueError:
+                        # If parsing fails, try other common formats
+                        try:
+                            preferred_time_obj = datetime.strptime(preferred_time, "%H:%M")
+                        except ValueError:
+                            log.warning(f"Could not parse preferred_time: {preferred_time}, using all slots")
+                            slots = all_slots[:3]
+                        else:
+                            # Filter slots >= preferred_time
+                            filtered_slots = []
+                            for slot in all_slots:
+                                try:
+                                    slot_time_obj = datetime.strptime(slot, "%H:%M")
+                                    if slot_time_obj.time() >= preferred_time_obj.time():
+                                        filtered_slots.append(slot)
+                                except ValueError:
+                                    log.warning(f"Could not parse slot time: {slot}")
+                                    continue
+                            
+                            # Limit to maximum 3 time slots
+                            slots = filtered_slots[:3]
+                    else:
+                        # Filter slots >= preferred_time
+                        filtered_slots = []
+                        for slot in all_slots:
+                            try:
+                                slot_time_obj = datetime.strptime(slot, "%H:%M")
+                                if slot_time_obj.time() >= preferred_time_obj.time():
+                                    filtered_slots.append(slot)
+                            except ValueError:
+                                log.warning(f"Could not parse slot time: {slot}")
+                                continue
+                        
+                        # Limit to maximum 3 time slots
+                        slots = filtered_slots[:3]
+                else:
+                    # No preferred_time, use first 3 slots
+                    slots = all_slots[:3]
                 
                 # Convert to readable format
                 try:
@@ -1091,8 +1139,55 @@ class AutomotiveBookingAssistant(Agent):
             if available_dates:
                 best_date = available_dates[0]
                 all_slots = self.available_slots[best_date]
-                # Limit to maximum 3 time slots
-                slots = all_slots[:3]
+                
+                # Filter slots based on preferred_time if provided
+                if preferred_time:
+                    # Normalize preferred_time format (handle both 17:00 and 7:00 formats)
+                    try:
+                        # Try parsing as 24-hour format first
+                        if ':' in preferred_time and len(preferred_time.split(':')[0]) <= 2:
+                            preferred_time_obj = datetime.strptime(preferred_time, "%H:%M")
+                        else:
+                            # Try parsing as 12-hour format
+                            preferred_time_obj = datetime.strptime(preferred_time, "%I:%M %p")
+                    except ValueError:
+                        # If parsing fails, try other common formats
+                        try:
+                            preferred_time_obj = datetime.strptime(preferred_time, "%H:%M")
+                        except ValueError:
+                            log.warning(f"Could not parse preferred_time: {preferred_time}, using all slots")
+                            slots = all_slots[:3]
+                        else:
+                            # Filter slots >= preferred_time
+                            filtered_slots = []
+                            for slot in all_slots:
+                                try:
+                                    slot_time_obj = datetime.strptime(slot, "%H:%M")
+                                    if slot_time_obj.time() >= preferred_time_obj.time():
+                                        filtered_slots.append(slot)
+                                except ValueError:
+                                    log.warning(f"Could not parse slot time: {slot}")
+                                    continue
+                            
+                            # Limit to maximum 3 time slots
+                            slots = filtered_slots[:3]
+                    else:
+                        # Filter slots >= preferred_time
+                        filtered_slots = []
+                        for slot in all_slots:
+                            try:
+                                slot_time_obj = datetime.strptime(slot, "%H:%M")
+                                if slot_time_obj.time() >= preferred_time_obj.time():
+                                    filtered_slots.append(slot)
+                            except ValueError:
+                                log.warning(f"Could not parse slot time: {slot}")
+                                continue
+                        
+                        # Limit to maximum 3 time slots
+                        slots = filtered_slots[:3]
+                else:
+                    # No preferred_time, use first 3 slots
+                    slots = all_slots[:3]
                 
                 # Convert to readable format
                 try:

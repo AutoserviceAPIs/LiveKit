@@ -4,8 +4,8 @@ from .agent_base import AutomotiveBookingAssistant
 from .agent_common import run_language_agent_entrypoint, prewarm
 from livekit.agents import JobContext, WorkerOptions, cli
 
-
 log = logging.getLogger("agent_en")
+log.propagate = False
 
 async def entrypoint(ctx):
     # Loud banner to confirm EN process is running

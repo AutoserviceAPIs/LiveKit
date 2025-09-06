@@ -1,9 +1,3 @@
-#TO BE CHANGED
-#   findCustomer: If find appointment
-#   reschedule_appointment
-#   cancel_appointment
-
-# your AutomotiveBookingAssistant base class/logic
 from .agent_customerdata import CARS_URL
 from .agent_common import CONFIRM_BY_LANG, LANG_MAP, normalize_lang, play_beeps
 from .agent_supervisor import Supervisor
@@ -11,8 +5,6 @@ from livekit import agents, rtc, api, agents
 from livekit.agents.metrics import TTSMetrics
 from livekit.protocol import room as room_msgs  # ✅ protocol types live here
 from livekit.protocol.sip import TransferSIPParticipantRequest
-from livekit.plugins import elevenlabs, deepgram, noise_cancellation, openai, silero
-from livekit.plugins.elevenlabs import VoiceSettings
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.agents.voice import Agent, RunContext
 from livekit.agents.llm import function_tool
@@ -20,13 +12,14 @@ from livekit.agents import (
     NOT_GIVEN, Agent, UserStateChangedEvent, AgentFalseInterruptionEvent,
     AgentSession, JobContext, JobProcess, MetricsCollectedEvent,
     RoomInputOptions, WorkerOptions, cli, metrics, get_job_context,)
-import logging, aiohttp, json, os, asyncio, time, subprocess, re, wave
+import logging, aiohttp, json, os, asyncio, time, subprocess, re, wave, inspect
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
-log = logging.getLogger("agent")
 load_dotenv(".env")
+log = logging.getLogger("agent_base")
+log.propagate = False
 logging.getLogger("livekit.agents").disabled = True
 logging.getLogger("asyncio").disabled = True
 
@@ -785,149 +778,128 @@ class AutomotiveBookingAssistant(Agent):
 
     @function_tool
     async def set_language(self, lang: str) -> str:
+        # --- reentrancy guard ---
         if getattr(self, "_handoff_inflight", False):
             return "BUSY"
 
-        canon = normalize_lang(lang)  # "French"/"fr-FR" -> "fr"
-        log.info(f"set_language lang = {canon}")
+        canon = normalize_lang(lang)  # e.g., "French" / "fr-FR" -> "fr"
+        log.info(f"set_language {lang} normalize_lang {canon}")
 
-        SUPPORTED = {"es", "fr", "hi", "vi"}
+        SUPPORTED = {"fr", "es"}
         if canon not in SUPPORTED:
-            await self.say("Sorry, that language isn’t available right now.")
+            try:
+                await self.say("Sorry, that language isn’t available right now.")
+            except Exception:
+                pass
             return "ERR_UNSUPPORTED_LANG"
 
-        if canon == getattr(self, "lang", "en"):
-            return "OK"
-
-        # Confirmation (let this one play)
-        key = LANG_MAP.get(lang, lang)
-        confirm_line = CONFIRM_BY_LANG.get(key) or CONFIRM_BY_LANG.get("en", "Switching language…")
-        await self.say(confirm_line)
-
-        self._handoff_inflight = True
-        self._is_shutting_down = True
+        # Ultra-short confirmation (in requested language)
+        CONFIRM = {"fr": "D’accord, je continue en français.",
+                   "es": "De acuerdo, continuaré en español."}
         try:
-            # stop background & timers
-            try: self.cancel_timeout()
-            except Exception: pass
+            await self.say(CONFIRM.get(canon, "Switching…"))
+        except Exception:
+            # don't block handoff on a TTS hiccup
+            pass
+
+        # Snapshot state for the child
+        try:
+            snapshot = self.snapshot_state()
+        except Exception:
+            snapshot = {
+                "state": getattr(self, "state", {}),
+                "customer_data": getattr(self, "customer_data", {}),
+                "available_slots": getattr(self, "available_slots", []),
+            }
+
+        # Ensure supervisor
+        if not getattr(self, "supervisor", None):
+            room = getattr(getattr(self._ctx, "room", None), "name", None) or "unknown_room"
+            self.supervisor = Supervisor(room=room, ready_timeout=25.0, single_spawn=True)
+
+        # --- HARD MUTE THIS EN JOB BEFORE SPAWN ---
+        self._handoff_inflight = True
+        self._suppress_responses = True  # ensure your on_item hooks bail
+        try:
+            # stop any background audio (hold/bgm/beeps)
             try:
                 if hasattr(self, "stop_background"):
                     await self.stop_background()
-            except Exception: pass
-
-            # ensure supervisor
-            if not getattr(self, "supervisor", None):
-                room = getattr(getattr(self._ctx, "room", None), "name", None)
-                if not room:
-                    self._is_shutting_down = False
-                    return "ERR_NO_SUPERVISOR"
-                self.supervisor = Supervisor(room=room, ready_timeout=18.0)
-
-            # snapshot
-            try:
-                snapshot = self.snapshot_state()
             except Exception:
-                snapshot = {
-                    "state": getattr(self, "state", {}),
-                    "customer_data": getattr(self, "customer_data", {}),
-                    "available_slots": getattr(self, "available_slots", []),
-                }
+                pass
 
-            # --------- HARD MUTE EN (blocks late LLM replies) ----------
-            self._suppress_responses = True  # our own guard used in handlers/say()
-
-            # Best-effort: disable input & output & kill any queued response
-            async def _mute_session():
-                # 1) disable user input mic → EN won't react
-                try: await self.session.update(input_audio_enabled=False)
-                except Exception: pass
-
-                # 2) stop output immediately (SDKs differ; try all patterns)
-                payloads = (
-                    {"output_audio_enabled": False},
-                    {"modalities": []},
-                    {"response": {"instructions": "", "stop": True}},
-                )
-                for p in payloads:
+            # cancel any in-flight TTS
+            for fn_name in ("cancel_current_response", "cancel_responses", "cancel_all_responses"):
+                fn = getattr(self.session, fn_name, None)
+                if callable(fn):
                     try:
-                        await self.session.update(p)
+                        await fn()
+                        break
                     except Exception:
                         pass
 
-                # 3) cancel any in-flight responses
-                for attr in ("cancel_current_response", "cancel_responses", "cancel_all_responses"):
-                    fn = getattr(self.session, attr, None)
-                    if callable(fn):
-                        try: await fn()
-                        except Exception: pass
+            # block further audio IO from this job
+            try:
+                # Transport-level mute
+                await self.session.update(output_audio_enabled=False, input_audio_enabled=False)
+            except Exception:
+                pass
+            try:
+                # Extra belt-and-suspenders: clear modalities if supported
+                await self.session.update({"modalities": []})
+            except Exception:
+                pass
 
-            await _mute_session()
-            # -----------------------------------------------------------
+            # (nice to have) stop any internal timeouts
+            try:
+                if hasattr(self, "cancel_timeout"):
+                    self.cancel_timeout()
+            except Exception:
+                pass
 
-            # (Optional) soft progress beeps while waiting (safe if you’ve added play_beeps)
-            # Comment out if you don't want beeps.
-            stop_evt = asyncio.Event()
-            async def _handoff_beeper():
-                try:
-                    while not stop_evt.is_set():
-                        try:
-                            if hasattr(self, "play_beeps"):
-                                room_for_audio = getattr(self.session, "room", None) or getattr(self._ctx, "room", None)
-                                if room_for_audio:
-                                    await self.play_beeps(room_for_audio, count=2, freq=1000, duration=0.12, gap=0.12, volume=0.38)
-                        except Exception:
-                            await asyncio.sleep(0.3)
-                        try:
-                            await asyncio.wait_for(stop_evt.wait(), timeout=0.35)
-                        except asyncio.TimeoutError:
-                            pass
-                except Exception:
-                    pass
-            beep_task = asyncio.create_task(_handoff_beeper())
-
-            # spawn child & wait READY
-            log.info(f"[HANDOFF] about to call supervisor.handoff(lang={canon}) supervisor={type(self.supervisor).__name__} id={id(self.supervisor)}")
+            # ---- Spawn target language child & wait READY ----
+            log.info("[HANDOFF] calling supervisor.handoff(lang=%s) …", canon)
             try:
                 await self.supervisor.handoff(canon, state_snapshot=snapshot)
                 log.info("[HANDOFF] supervisor.handoff() returned READY")
             except TimeoutError:
-                if not stop_evt.is_set(): stop_evt.set()
-                try: await asyncio.wait_for(beep_task, timeout=0.3)
-                except Exception: beep_task.cancel()
+                log.warning("[HANDOFF] timeout waiting READY for %s → PENDING", canon)
                 return "PENDING"
             except RuntimeError as e:
-                if not stop_evt.is_set(): stop_evt.set()
-                try: await asyncio.wait_for(beep_task, timeout=0.3)
-                except Exception: beep_task.cancel()
-                log.warning(f"[HANDOFF] child error treated as PENDING: {e}")
+                # Child exited before READY, etc. Treat as pending so UX can keep going.
+                log.warning("[HANDOFF] child error treated as PENDING: %s", e)
                 return "PENDING"
-            except Exception as e:
-                if not stop_evt.is_set(): stop_evt.set()
-                try: await asyncio.wait_for(beep_task, timeout=0.3)
-                except Exception: beep_task.cancel()
-                # allow apology
-                self._is_shutting_down = False
-                try:
-                    self._suppress_responses = False
-                    await self.session.update(input_audio_enabled=True, output_audio_enabled=True)
-                except Exception: pass
-                await self.say("I couldn’t switch languages right now. We can continue here or I can transfer you to a person.")
-                return f"ERR_HANDOFF_FAILED:{e}"
-            finally:
-                if 'stop_evt' in locals() and not stop_evt.is_set():
-                    stop_evt.set()
 
-            # READY → **leave the room** completely as EN
+            # ---- READY → cleanly remove EN participant from the room ----
             try:
-                await self.session.close()
-            except Exception:
-                pass
+                fn = getattr(self._ctx, "shutdown", None)
+                if callable(fn):
+                    maybe = fn()  # may be None or awaitable
+                    if inspect.isawaitable(maybe) or inspect.iscoroutine(maybe):
+                        await maybe
+                else:
+                    # At least close the session
+                    await self.session.close()
+            except Exception as e:
+                log.warning("[HANDOFF] EN shutdown error (continuing): %s", e)
 
             return "OK"
 
+        except Exception as e:
+            # Re-enable just enough to apologize
+            try:
+                self._suppress_responses = False
+                await self.session.update(output_audio_enabled=True, input_audio_enabled=True)
+            except Exception:
+                pass
+            try:
+                await self.say("I couldn’t switch languages right now. We can continue here or I can transfer you to a person.")
+            except Exception:
+                pass
+            return f"ERR_HANDOFF_FAILED:{e}"
+
         finally:
             self._handoff_inflight = False
-
 
 
     @function_tool
@@ -1025,6 +997,7 @@ class AutomotiveBookingAssistant(Agent):
         # Call the main save function
         return await self.save_services_detail(context, services, transportation, mileage)
 
+    
     @function_tool
     #Added preferred_time
     async def check_available_slots(self, context: RunContext, preferred_date: Optional[str] = None, preferred_time: Optional[str] = None) -> str:

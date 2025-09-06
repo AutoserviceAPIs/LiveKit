@@ -1,8 +1,3 @@
-# agent_common imports agent_base and app_common.
-# agent_base should not import agent_common.
-# agent_en/es/fr import agent_common (and not vice versa).
-# supervisor doesn’t import agents; it spawns them via python -m app.agent_es etc.
-
 from __future__ import annotations  # optional, but nice to have in 3.11+
 from typing import TYPE_CHECKING
 #if TYPE_CHECKING:
@@ -35,8 +30,11 @@ from pathlib import Path
 from collections import defaultdict
 
 log = logging.getLogger("agent_common")
+log.propagate = False
+logging.getLogger("livekit").disabled = True
 logging.getLogger("livekit.agents").disabled = True
 logging.getLogger("asyncio").disabled = True
+logging.getLogger("root").disabled = True
 
 LLM_MODEL = "gpt-4o-mini"
 _CHILD_LOCK_DIR = Path("/tmp/agent_childlocks")
@@ -82,6 +80,7 @@ COMMON_PROMPT = f"""You are a booking assistant. Help customers book appointment
 - At the beginning of the conversation, call lookup_customer (We already have customer phone number): returns customer name, car details, or booking details.
 
 ## RULES:
+- If user responds to greeting, ignore and proceed
 - After collecting car year make and model: call save_customer_information
 - After collecting services and transportation: call validate_and_save_services (MANDATORY - must be called immediately after getting transportation)
 - After collecting date and time: call check_available_slots
@@ -142,6 +141,15 @@ Step 6. Find availability
 
 
 FOUND_APPT_PROMPT = f"""You are a booking assistant. Help customers book appointments.
+
+## CURRENT DATE INFORMATION:
+- Today's date is: {current_date} ({current_date_readable})
+- Use this information when customers ask about "today", "tomorrow", or specific dates
+- if morning use time-7 AM
+- if afternoon use time=2 PM
+- if evening use time=5 PM
+- If date not provided: use today's date
+- If time not provided: use time=7 AM
 
 ## CUSTOMER LOOKUP:
 - At the beginning of the conversation, call lookup_customer (We already have customer phone number): returns customer name, car details, or booking details.
@@ -264,6 +272,13 @@ CONFIRM_BY_LANG = {
 }
 
 
+MODULE_BY_LANG = {
+    "fr": "app.agent_fr",
+    "es": "app.agent_es",   # if you have it
+    "en": "app.agent_en",   # rarely used for handoff, but ok to keep
+}
+
+    
 SUPPORTED_STT_LANGS = {"en-US","es","fr","hi","vi","vi-VN","zh","zh-CN"}
 
 
@@ -371,6 +386,7 @@ def _signal_ready(room_name: str, lang: str):
 
 
 def choose_prompt_by_flags(lang: str, found_cust: bool, found_appt: bool) -> str:
+    log.info(f"choose_prompt_by_flags - lang {lang}")
     # Use per-language if you have them; else fallback to globals.
     if found_appt and "FOUND_APPT_PROMPT" in globals():
         # If you maintain language-specific variants, use e.g. FOUND_APPT_PROMPT_BY_LANG[lang]
@@ -401,67 +417,97 @@ def _release_room_lock(room_name: str) -> None:
         pass
 
 
-async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tools=None):
+async def run_language_agent_entrypoint(
+    ctx,
+    lang: str,
+    *,
+    supervisor=None,
+    tools=None,
+    skip_connect: bool = False,   # keep your flag
+    skip_shutdown: bool = True,   # keep your flag
+):
+    import inspect, asyncio, re
+    from pathlib import Path
+
+    def _shutdown_is_awaitable(x):
+        fn = getattr(x, "shutdown", None)
+        return callable(fn) and inspect.iscoroutinefunction(fn)
+
+    async def _shutdown_compat(x):
+        fn = getattr(x, "shutdown", None)
+        if not callable(fn):
+            return
+        if inspect.iscoroutinefunction(fn):
+            await fn()
+        else:
+            try:
+                fn()
+            except Exception:
+                pass
+
     log.info(f"run_language_agent_entrypoint - lang {lang}")
 
-    # 0) connect EARLY so ctx.room is valid
+    # --- connect only if needed (keeps pickup behavior unchanged) ---
     try:
-        await ctx.connect()
+        if not skip_connect and getattr(ctx, "room", None) is None:
+            await ctx.connect()
     except Exception as e:
         log.exception("job_ctx.connect() failed: %s", e)
-        # clean shutdown to avoid LK warning
-        try:
-            await ctx.shutdown()
-        finally:
-            return
+        if not skip_shutdown:
+            try:
+                await _shutdown_compat(ctx)
+            finally:
+                return
+        return
 
-    # 1) resolve room + logging context
+    # room / logging context
     room_obj  = getattr(ctx, "room", None)
     room_name = getattr(room_obj, "name", None) or os.getenv("HANDOFF_ROOM") or "unknown_room"
     ctx.log_context_fields = {"room": room_name}
 
-    # 2) normalize language
+    # normalize
     _norm = {"en-US": "en", "en": "en", "es": "es", "fr": "fr",
              "French": "fr", "English": "en", "Spanish": "es"}
     lang = _norm.get(lang, lang)
     assert lang in ("en", "es", "fr"), f"Unsupported lang: {lang}"
     DEEPGRAM_LANG = {"en": "en-US", "es": "es", "fr": "fr"}
 
-    # 3) child/room gating
-    from pathlib import Path
+    # --- child/room gating (prevents double spawns) ---
     is_handoff_child = (os.getenv("HANDOFF_LANG") == lang)
     acquired_room_singleflight = False
     child_token: str | None = None
 
     if is_handoff_child:
-        # cross-proc dedupe: only one primary child should proceed
         child_token = _acquire_child_lock(room_name, lang, ttl_sec=180)
         if child_token is None:
-            # secondary child: wait for READY then exit cleanly
+            # Secondary child: wait for primary READY and exit quietly
             ready_path = Path(f"/tmp/{room_name}-READY-{lang}")
             log.warning(f"[{lang}] secondary handoff child for {room_name}; waiting for READY then exiting")
             step, waited, timeout = 0.1, 0.0, 30.0
             while waited < timeout and not ready_path.exists():
                 await asyncio.sleep(step); waited += step
-            try:
-                await ctx.shutdown()
-            finally:
-                return
+            if not skip_shutdown:
+                try:
+                    await _shutdown_compat(ctx)
+                finally:
+                    return
+            return
         else:
-            log.info(f"[{lang}] PRIMARY child lock acquired at {child_token}")
+            log.info(f"[{lang}] PRIMARY child lock acquired")
     else:
         if not _singleflight_room(room_name):
             log.warning(f"[{lang}] duplicate entrypoint for room={room_name}; exiting")
-            # clean shutdown to avoid LK warning
-            try:
-                await ctx.shutdown()
-            finally:
-                return
+            if not skip_shutdown:
+                try:
+                    await _shutdown_compat(ctx)
+                finally:
+                    return
+            return
         acquired_room_singleflight = True
 
-    # 4) main boot
+    # --- main boot ---
     try:
-        # lookup seed by phone (best-effort)
+        # lookup/seed
         phone_number = extract_phone_from_room_name(room_name)
         found_cust = found_appt = False
         seed = {}
@@ -474,17 +520,14 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
             except Exception as e:
                 log.warning(f"[{lang}] lookup failed: {e}")
 
-        # VAD resolution (safe if missing)
+        # VAD
         vad_obj = None
         try:
             vad_obj = (getattr(getattr(ctx, "proc", None), "userdata", {}) or {}).get("vad") \
                       or getattr(ctx, "userdata", {}).get("vad")
         except Exception:
             vad_obj = None
-        if vad_obj:
-            log.info(f"[{lang}] using provided VAD: {type(vad_obj).__name__}")
-        else:
-            log.info(f"[{lang}] no VAD provided; continuing without explicit VAD")
+        log.info(f"[{lang}] VAD: {'provided' if vad_obj else 'none'}")
 
         # session
         session = AgentSession(
@@ -493,29 +536,24 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
             tts=elevenlabs.TTS(
                 voice_id=VOICE_BY_LANG[lang],
                 model="eleven_flash_v2_5",
-                voice_settings=VoiceSettings(
-                    similarity_boost=0.75,
-                    stability=0.5,
-                    style=0.5,
-                    use_speaker_boost=True
-                ),
+                voice_settings=VoiceSettings(similarity_boost=0.95, stability=0.8, style=0.7, use_speaker_boost=True),
             ),
             turn_detection=MultilingualModel(),
             vad=vad_obj,
             preemptive_generation=False,
         )
 
-        # (optional) install your TTS sanitizer hook if you have one
+        # optional speech sanitizer (no-op if not present)
         try:
-            install_speech_sanitizer(session)  # noop if not defined
+            install_speech_sanitizer(session)
         except Exception:
             pass
 
-        # prompt selection
+        # prompt
         final_prompt = choose_prompt_by_flags(lang, found_cust, found_appt)
         if found_appt:
             final_prompt = FOUND_APPT_PROMPT
-        #log.info(f"final_prompt = {final_prompt}")
+        log.info(f"final_prompt = {final_prompt}")
 
         # agent
         from .agent_base import AutomotiveBookingAssistant
@@ -526,11 +564,9 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
             supervisor=supervisor,
         )
         agent.lang = lang
-        log.info(f"AGENT FOR {lang} IS CONSTRUCTED")
         if phone_number:
             agent._sip_participant_identity = f'sip_{phone_number}'
             agent.customer_data["phone"] = phone_number
-
         if seed:
             agent.customer_data.update(seed)
             if found_appt and hasattr(agent, "set_current_state"):
@@ -540,7 +576,6 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
             elif hasattr(agent, "set_current_state"):
                 agent.set_current_state("get name")
 
-        # handlers/metrics/transcript
         _attach_common_handlers(session, agent, tag=lang.upper())
         usage_collector = metrics.UsageCollector()
 
@@ -564,13 +599,12 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
 
         register_transcript_writer(ctx, session, agent)
 
-        # start recording (ignore pre-join failures)
         try:
             await start_recording(ctx, agent)
         except Exception as e:
             log.debug(f"[{lang}] start_recording pre-join failed (ok): {e}")
 
-        # join the room (ctx.room was created by ctx.connect above)
+        # ---- JOIN THE ROOM ----
         await session.start(
             agent=agent,
             room=ctx.room,
@@ -580,7 +614,56 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
             ),
         )
 
-        # post-start session update (prompt/tools)
+        # >>> READY SIGNAL ASAP (before greet; this unblocks supervisor/en) <<<
+        ready_path = Path(f"/tmp/{room_name}-READY-{lang}")
+        try:
+            ready_path.touch(exist_ok=True)
+            log.info(f"[{lang}] READY flag created at {ready_path}")
+        except Exception as e:
+            log.warning(f"[{lang}] READY touch failed: {e}")
+
+        # --- SAFETY: ensure audio IO ON for this job ---
+        try:
+            if hasattr(session, "update"):
+                await session.update(input_audio_enabled=True, output_audio_enabled=True)
+        except Exception as e:
+            log.warning(f"[{lang}] could not enable IO on session: {e}")
+
+        # --- FORCE SUBSCRIBE to remote audio (SIP) so FR can hear user ---
+        try:
+            remotes = getattr(ctx.room, "remote_participants", {}) or {}
+            for p in list(remotes.values()):
+                tracks = getattr(p, "tracks", []) or []
+                for tr in tracks:
+                    pub = getattr(tr, "publication", None)
+                    kind = getattr(pub, "kind", None)
+                    # kind can be enum/string/int depending on sdk version
+                    is_audio = (getattr(kind, "name", str(kind)).lower().find("audio") >= 0) if kind is not None else False
+                    if is_audio and hasattr(pub, "set_subscribed"):
+                        try:
+                            await pub.set_subscribed(True)
+                        except Exception:
+                            pass
+            # diag
+            try:
+                rp = getattr(ctx.room, "remote_participants", {}) or {}
+                diag = []
+                for p in rp.values():
+                    ident = getattr(p, "identity", "?")
+                    audio_cnt = 0
+                    for tr in (getattr(p, "tracks", []) or []):
+                        pub = getattr(tr, "publication", None)
+                        k = getattr(pub, "kind", None)
+                        if k is not None and str(getattr(k, "name", k)).lower().find("audio") >= 0:
+                            audio_cnt += 1
+                    diag.append({"id": ident, "audio_tracks": audio_cnt})
+                log.info(f"[{lang}] remotes: {diag}")
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning(f"[{lang}] audio subscribe sweep failed: {e}")
+
+        # Optional prompt/tools update
         try:
             upd = {"instructions": final_prompt}
             if tools:
@@ -592,14 +675,6 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
         except Exception as e:
             log.warning(f"[{lang}] session update failed: {e}")
 
-        # signal READY for handoff children
-        ready_path = Path(f"/tmp/{room_name}-READY-{lang}")
-        try:
-            ready_path.touch(exist_ok=True)
-            log.info(f"[{lang}] READY flag created at {ready_path}")
-        except Exception as e:
-            log.warning(f"[{lang}] READY touch failed: {e}")
-
         # greet
         greet_text, next_state = build_dynamic_greeting_and_next(agent, lang)
         if hasattr(agent, "set_current_state"):
@@ -609,7 +684,7 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
         log.info(f"run_language_agent_entrypoint - Greet text: {greet_text}")
         await agent.say(greet_text)
 
-        # keep the job alive until the room disconnects
+        # keep alive for the call
         await ctx.wait_until_disconnected()
 
     finally:
@@ -620,6 +695,12 @@ async def run_language_agent_entrypoint(ctx, lang: str, *, supervisor=None, tool
             _release_child_lock(child_token)
         except Exception:
             pass
+
+        if not skip_shutdown and not skip_connect:
+            try:
+                await _shutdown_compat(ctx)
+            except Exception:
+                pass
 
 
 def _attach_common_handlers(session: "AgentSession", agent, tag: str):

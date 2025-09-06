@@ -1,55 +1,32 @@
-import logging, os
-from .agent_supervisor import LanguageSupervisor, OneShotSupervisor
-from .agent_base import AutomotiveBookingAssistant
-from .agent_common import run_language_agent_entrypoint, prewarm
+import os, sys, logging, asyncio, traceback, inspect
 from livekit.agents import JobContext, WorkerOptions, cli
-
-# --- logging: make sure prints/logs show up immediately ---
-os.environ.setdefault("PYTHONUNBUFFERED", "1")
-if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s %(name)s - %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+from .agent_supervisor import Supervisor
+from .agent_common import run_language_agent_entrypoint  # runner should NOT connect/shutdown if we ask it not to
 
 log = logging.getLogger("agent_es")
+log.propagate = False
+
+# Avoid duplicate root handlers
+if not logging.getLogger().handlers:
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s %(name)s - %(message)s"))
+    logging.getLogger().addHandler(h)
+    logging.getLogger().setLevel(logging.INFO)
+
 
 async def entrypoint(ctx):
-    """
-    Spanish agent entrypoint:
-      - Ensures HANDOFF_ROOM/HANDOFF_LANG are set (for supervisor handoff)
-      - Logs the resolved env clearly
-      - Delegates to run_language_agent_entrypoint(ctx, "es")
-        which MUST: join the room, then touch /tmp/{HANDOFF_ROOM}-READY-es, then greet.
-    """
-    log.info("***********ES AGENT***************")
+    # Loud banner to confirm EN process is running
+    log.info("***********ES AGENT ENTRYPOINT***************")
 
-    # Ensure the child knows the room even if spawned without CLI args
-    room_name = None
-    if getattr(ctx, "room", None) and getattr(ctx.room, "name", None):
-        room_name = ctx.room.name
-    env_room = os.environ.get("HANDOFF_ROOM") or room_name or "unknown_room"
-    os.environ["HANDOFF_ROOM"] = env_room
+    # Mark env for child/handoff
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    os.environ["HANDOFF_ROOM"] = ctx.room.name
+    os.environ["HANDOFF_LANG"] = "es"
 
-    # Mark this process as the ES handoff child (lets the child bypass singleflight)
-    os.environ.setdefault("HANDOFF_LANG", "es")
-
-    log.info(f"[fr] entrypoint starting: HANDOFF_ROOM={os.environ.get('HANDOFF_ROOM')} "
-             f"HANDOFF_LANG={os.environ.get('HANDOFF_LANG')}")
-
-    try:
-        # Delegate to the shared boot logic (it will:
-        #  - normalize 'fr'
-        #  - build STT/TTs for FR
-        #  - session.start(...)
-        #  - write READY file: /tmp/{HANDOFF_ROOM}-READY-fr
-        #  - greet in French
-        await run_language_agent_entrypoint(ctx, "fr")
-    except Exception as e:
-        # Make any startup failure VERY visible
-        log.exception("[fr] fatal error in entrypoint: %s", e)
-        raise
+    # 3) Supervisor (single spawn)
+    sup = Supervisor(room=ctx.room.name, ready_timeout=18.0, single_spawn=True)
+    await run_language_agent_entrypoint(ctx, "fr", supervisor=sup, tools=None, skip_connect=True, skip_shutdown=True)
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=None))
+    from livekit.agents import cli
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="test"))

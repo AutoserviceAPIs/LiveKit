@@ -29,10 +29,10 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Dependency install first for better caching
-COPY pyproject.toml uv.lock requirements.txt ./
+COPY pyproject.toml uv.lock ./
 RUN mkdir -p src
 RUN uv sync --locked
-RUN pip install -r requirements.txt
+# RUN pip install -r requirements.txt
 
 # Copy application code
 COPY . .
@@ -42,5 +42,8 @@ USER appuser
 # Pre-download models/assets at build time
 RUN uv run src/agent.py download-files
 
+# Expose health check port
+EXPOSE 8081
+
 # Start the agent
-CMD ["uv", "run", "agent.py", "start"]
+CMD ["uv", "run", "-m", "app.agent_en", "start"]

@@ -119,7 +119,7 @@ Step 3. Gather services
 Step 4. Gather transportation
 - After capture services, Ask if will be dropping off the vehicle or waiting while we do the work for <services>
 - Wait for transportation
-- IMMEDIATELY after getting transportation, call validate_and_save_services with services and transportation
+- IMMEDIATELY after getting transportation, call validate_and_save_services with services and transportation and call save_services_detail if everything is good
 - Must go to Step 5 before Step 6
 
 Step 5. Ask date and time
@@ -153,7 +153,6 @@ FOUND_APPT_PROMPT = f"""You are a booking assistant. Help customers book appoint
 
 ## CUSTOMER LOOKUP:
 - At the beginning of the conversation, call lookup_customer (We already have customer phone number): returns customer name, car details, or booking details.
-- next, call check_available_slots
 
 ## Follow this conversation flow:
 Step 1. Reschedule or Cancel

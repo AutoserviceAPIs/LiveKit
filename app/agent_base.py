@@ -535,14 +535,11 @@ class AutomotiveBookingAssistant(Agent):
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(api_url, params=payload, headers={"Content-Type": "application/json"}) as response:
+                async with session.get(api_url, params=payload) as response:
                     if response.status == 200:
-                        data = await response.json()
-                        log.info(f"Customer info written successfully: {data}")
+                        log.info(f"Customer info written successfully")
                     else:
                         log.error(f"Failed to write customer info: HTTP {response.status}")
-                        response_text = await response.text()
-                        log.error(f"Response: {response_text}")
                         
         except Exception as e:
             log.error(f"Error writing customer info to API: {e}")
@@ -998,6 +995,35 @@ class AutomotiveBookingAssistant(Agent):
         return await self.save_services_detail(context, services, transportation, mileage)
 
     
+    def _format_time_readable(self, time_str: str) -> str:
+        """Format time string for TTS to read naturally (e.g., 8 AM instead of 8:00 AM)"""
+        try:
+            time_obj = datetime.strptime(time_str, "%H:%M")
+            hour = time_obj.hour
+            minute = time_obj.minute
+            
+            if hour == 0:
+                display_hour = 12
+                period = "AM"
+            elif hour < 12:
+                display_hour = hour
+                period = "AM"
+            elif hour == 12:
+                display_hour = 12
+                period = "PM"
+            else:
+                display_hour = hour - 12
+                period = "PM"
+            
+            if minute == 0:
+                # For TTS: "8 AM" instead of "8:00 AM" to avoid "eight o'clock AM"
+                return f"{display_hour} {period}"
+            else:
+                # For times with minutes: "8:30 AM" reads as "eight thirty AM"
+                return f"{display_hour}:{minute:02d} {period}"
+        except Exception:
+            return time_str
+
     @function_tool
     #Added preferred_time
     async def check_available_slots(self, context: RunContext, preferred_date: Optional[str] = None, preferred_time: Optional[str] = None) -> str:
@@ -1067,18 +1093,13 @@ class AutomotiveBookingAssistant(Agent):
                 try:
                     # Parse the date once
                     date_obj = datetime.strptime(preferred_date, "%Y-%m-%d")
-                    readable_date = date_obj.strftime("%B %d, %Y")
+                    readable_date = date_obj.strftime("%B %d")
                     
                     # Format times
                     readable_times = []
                     for slot in slots:
-                        try:
-                            time_obj = datetime.strptime(slot, "%H:%M")
-                            readable_time = time_obj.strftime("%I:%M %p").lstrip('0')
-                            readable_times.append(readable_time)
-                        except Exception as e:
-                            log.warning(f"Failed to format slot {slot}: {e}")
-                            readable_times.append(slot)
+                        readable_time = self._format_time_readable(slot)
+                        readable_times.append(readable_time)
                     
                     # Format with "and" for the last item
                     if len(readable_times) == 1:
@@ -1087,12 +1108,14 @@ class AutomotiveBookingAssistant(Agent):
                         time_str = f"{readable_times[0]} and {readable_times[1]}"
                     else:
                         time_str = f"{', '.join(readable_times[:-1])} and {readable_times[-1]}"
-                    
+                    print(f"Available slots: {readable_date} at {time_str}")
                     return f"Available slots: {readable_date} at {time_str}"
                 except Exception as e:
                     log.warning(f"Failed to format date {preferred_date}: {e}")
+                    print(f"Available slots: {preferred_date}: {', '.join(slots)}")
                     return f"Available slots on {preferred_date}: {', '.join(slots)}"
             else:
+                print(f"No available slots on {preferred_date}")
                 return f"No available slots on {preferred_date}"
         else:
             # Return only 1 date with up to 3 time slots, prioritizing same day if available
@@ -1166,18 +1189,13 @@ class AutomotiveBookingAssistant(Agent):
                 try:
                     # Parse the date once
                     date_obj = datetime.strptime(best_date, "%Y-%m-%d")
-                    readable_date = date_obj.strftime("%B %d, %Y")
+                    readable_date = date_obj.strftime("%B %d")
                     
                     # Format times
                     readable_times = []
                     for slot in slots:
-                        try:
-                            time_obj = datetime.strptime(slot, "%H:%M")
-                            readable_time = time_obj.strftime("%I:%M %p").lstrip('0')
-                            readable_times.append(readable_time)
-                        except Exception as e:
-                            log.warning(f"Failed to format slot {slot}: {e}")
-                            readable_times.append(slot)
+                        readable_time = self._format_time_readable(slot)
+                        readable_times.append(readable_time)
                     
                     # Format with "and" for the last item
                     if len(readable_times) == 1:
@@ -1189,12 +1207,14 @@ class AutomotiveBookingAssistant(Agent):
                     
                     self._current_state = "check availability"
                     log.info(f"check_available_slots: current_action={self._current_state}")
-                    
+                    print(f"Available slots: {readable_date} at {time_str}")
                     return f"Available slots: {readable_date} at {time_str}"
                 except Exception as e:
                     log.warning(f"Failed to format date {best_date}: {e}")
+                    print(f"Available slots on {best_date}: {', '.join(slots)}")
                     return f"Available slots on {best_date}: {', '.join(slots)}"
             else:
+                print("No available slots found")
                 return "No available slots found"
 
 
